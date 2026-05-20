@@ -1,0 +1,113 @@
+name: phuzz-bwapp-rfi
+
+# bWAPP Remote File Inclusion → SSRF
+# Security level: 0 (low — no sanitisation on 'language' param)
+# Endpoint: GET /rlfi.php?language=<payload>&action=go
+# Vulnerable code: include($language)   (line 174, security_level=0)
+#
+# Detection path:
+#   1. SSRFMutator injects http://172.20.0.10:8000/<token> as 'language'
+#   2. PHP calls include("http://172.20.0.10:8000/<token>")
+#   3. __FuzzerSSRFStreamWrapper.stream_open() fires (09_ssrf_stream.php)
+#      → writes ssrf-hooks/<covID>.json  (function: "include(http)")
+#   4. PHP's http wrapper fetches the URL → OOB listener writes oob-logs/<token>.json
+#   5. SSRFVulnCheck matches hook + OOB → writes ssrf-error-reports/<covID>.json
+#
+# Note: include() is a language construct; uopz_set_hook() cannot hook it.
+# We replace PHP's built-in 'http' stream wrapper instead (09_ssrf_stream.php).
+
+services:
+
+  phuzz-oob:
+    build:
+      context: ./oob
+      dockerfile: Dockerfile
+    volumes:
+      - shared-tmpfs:/shared-tmpfs
+    networks:
+      phuzz-net:
+        ipv4_address: 172.20.0.10
+
+  phuzz-db:
+    image: mysql:8
+    command: mysqld
+    environment:
+      MYSQL_DATABASE:      db
+      MYSQL_USER:          user
+      MYSQL_PASSWORD:      password
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_HOST:     "%"
+    networks:
+      phuzz-net:
+        aliases: [db]
+
+  phuzz-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE:     bwapp
+      FUZZER_COVERAGE_PATH: /var/www/html/
+      FUZZER_COMPRESS:      0
+      REQUIRES_DB:          1
+    volumes:
+      - ./web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8083:80"
+    dns:
+      - 172.20.0.10
+    extra_hosts:
+      - "oob.phuzz:172.20.0.10"
+    networks:
+      phuzz-net:
+        aliases: [web]
+    depends_on: [phuzz-db, phuzz-oob]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared-tmpfs/web-paths.txt"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+
+  phuzz-fuzzer-1:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   1
+      FUZZER_CONFIG:    bwapp/rlfi_ssrf
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks: [phuzz-net]
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000"
+  sync-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=256m,uid=1000"
+
+networks:
+  phuzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

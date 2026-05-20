@@ -1,0 +1,5 @@
+experiments/
+.claude/
+.vscode/
+SESSION_CONTEXT.md
+thesis/*.zip

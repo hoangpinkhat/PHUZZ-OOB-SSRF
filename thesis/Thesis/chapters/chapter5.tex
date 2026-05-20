@@ -1,0 +1,168 @@
+\chapter{Kết luận và Hướng Phát triển}
+
+% ============================================================
+\section{Kết luận}
+\label{sec:conclusion}
+% ============================================================
+
+Khóa luận này xuất phát từ một quan sát thực tế: mặc dù greybox fuzzing
+là hướng tiếp cận mạnh mẽ nhất hiện nay trong kiểm thử bảo mật tự động,
+toàn bộ các công cụ thuộc thế hệ này --- bao gồm Phuzz, webFuzz, và
+Witcher --- đều bỏ sót hoàn toàn lớp lỗ hổng Blind SSRF. Nguyên nhân
+cốt lõi là vòng lặp fuzzing truyền thống chỉ quan sát hai tín hiệu:
+độ phủ mã và ngoại lệ. Blind SSRF không để lại dấu vết trong cả hai
+kênh này --- ứng dụng vẫn chạy bình thường, không có exception, không
+có dòng code mới, chỉ có một kết nối mạng âm thầm được thực hiện ở
+tầng hệ điều hành.
+
+Hướng giải quyết được đề xuất là \textbf{bổ sung kênh tín hiệu
+Out-of-Band} vào vòng lặp fuzzing, thay vì cố gắng suy luận từ các
+tín hiệu hiện có. Nếu dấu vết duy nhất của Blind SSRF là kết nối mạng
+tới địa chỉ ngoài mong đợi, ta đặt một máy chủ lắng nghe tại địa chỉ
+đó và đưa tín hiệu callback trở lại vòng lặp như một kênh phản hồi độc
+lập.
+
+\subsection{Đóng góp của khóa luận}
+
+Khóa luận đã thiết kế và cài đặt đầy đủ bốn thành phần mới tích hợp
+vào nền tảng Phuzz:
+
+\textbf{1. Bộ đột biến SSRF chuyên biệt.} \texttt{SSRFMutator} sinh
+payload OOB theo round-robin qua 21 biến thể, tổ chức thành ba nhóm
+(IP-based, DNS-based, hostname-based) để bao phủ các cơ chế lọc đầu
+vào phổ biến. \texttt{CmdInjectionSSRFMutator} bổ sung 10 biến thể
+command injection cho các endpoint có nguy cơ lệnh shell. Thiết kế
+nhiều biến thể được chứng minh là cần thiết trong thực tế: hai trong
+sáu CVE được kiểm thử --- Canto (CVE-2020-28975) và elFinder
+(CVE-2021-32682) --- chỉ phát hiện được qua biến thể đặc thù
+(scheme-less bypass và hostname indirection), không phải biến thể
+plain IP thông thường.
+
+\textbf{2. Máy chủ OOB lắng nghe.} Container \texttt{phuzz-oob} chạy
+Flask HTTP/HTTPS listener và dnsmasq phân giải wildcard DNS
+\texttt{*.oob}. Cơ chế ghi log nguyên tử (\texttt{os.rename}) trên
+shared-tmpfs đảm bảo fuzzer không bao giờ đọc file chưa hoàn chỉnh.
+Thiết kế container độc lập cho phép tái sử dụng OOB server với bất kỳ
+ứng dụng mục tiêu nào mà không cần sửa đổi.
+
+\textbf{3. Lớp hook PHP hai tầng.} \texttt{SSRFVulnCheck} kết hợp
+tín hiệu in-band (PHP hook ghi nhận lời gọi hàm mạng) và tín hiệu OOB
+(callback từ ứng dụng mục tiêu) theo logic AND: chỉ khi cả hai file
+bằng chứng cùng tồn tại mới xác nhận lỗ hổng. Module hook
+\texttt{08\_ssrf.php} triển khai 23 hook trên 5 nhóm hàm qua UOPZ,
+bao phủ từ \texttt{curl\_exec}, \texttt{file\_get\_contents}, các hàm
+socket, shell execution, đến WordPress HTTP API wrappers.
+
+\textbf{4. PHP stream wrapper.} \texttt{09\_ssrf\_stream.php} đăng ký
+lại built-in wrapper cho scheme \texttt{http} và \texttt{https}, cho
+phép interceptsâu language construct \texttt{include} và
+\texttt{require\_once} mà UOPZ không thể hook. Lớp này lấp khoảng
+trống phát hiện cho lớp lỗ hổng Remote File Inclusion (RFI) --- được
+xác nhận qua thực nghiệm với bWAPP và Mutillidae.
+
+\subsection{Kết quả thực nghiệm}
+
+Thực nghiệm trên 14 ca kiểm thử (8 ứng dụng lab với tổng cộng 11
+endpoint, 6 CVE thực tế) cho thấy:
+
+\begin{itemize}
+    \item \textbf{Tỷ lệ phát hiện: 14/14 (100\%)} --- toàn bộ lỗ hổng
+    SSRF trên các mục tiêu đã kiểm thử đều được phát hiện.
+    \item \textbf{False positive: 0} --- cơ chế AND logic hai tầng
+    đảm bảo mỗi báo cáo đều có bằng chứng mạng thực tế.
+    \item \textbf{Phuzz gốc: 0/14} --- xác nhận thực nghiệm rằng tín
+    hiệu truyền thống hoàn toàn bất lực trước Blind SSRF.
+    \item Năm loại sink function khác nhau được bao phủ:
+    \texttt{file\_get\_contents}, \texttt{curl\_exec},
+    \texttt{include}/\texttt{require\_once} (qua stream wrapper),
+    \texttt{shell\_exec}, và \texttt{getimagesize} --- hai loại cuối là
+    sink không trực quan mà hầu hết công cụ khác bỏ sót.
+\end{itemize}
+
+Kết quả này khẳng định rằng \textbf{mở rộng kênh tín hiệu phản hồi
+là hướng tiếp cận khả thi và hiệu quả} để lấp khoảng trống mà các
+greybox fuzzer truyền thống để lại.
+
+% ============================================================
+\section{Hạn chế}
+\label{sec:limitations}
+% ============================================================
+
+Dù đạt kết quả khả quan, hệ thống hiện tại có một số hạn chế cần
+nhìn nhận thẳng thắn:
+
+\textbf{Phạm vi ngôn ngữ.} Hệ thống chỉ hỗ trợ PHP. Các ứng dụng
+viết bằng Python (Django, Flask), Node.js, hay Java/Spring đều nằm
+ngoài tầm bao phủ hiện tại, dù kiến trúc OOB listener và cơ chế
+phát hiện hai tầng về nguyên lý có thể áp dụng cho bất kỳ ngôn ngữ
+nào.
+
+\textbf{Stored SSRF.} Hệ thống không xử lý được Stored SSRF --- dạng
+tấn công trong đó payload được lưu vào database và kích hoạt SSRF ở
+một request hoàn toàn khác sau đó. Trong trường hợp này, token từ
+request gốc và OOB callback từ request thứ cấp không có cơ chế tự
+động liên kết.
+
+\textbf{Thời gian phát hiện trên WordPress.} CVE-2020-24148 mất
+khoảng 506 giây để phát hiện, chủ yếu do overhead từ WordPress
+bootstrap và quá trình đăng nhập. Với giới hạn thời gian 600 giây,
+biên độ an toàn không lớn; các ứng dụng WordPress phức tạp hơn có
+thể vượt giới hạn này.
+
+\textbf{Quy mô thực nghiệm.} 14 ca kiểm thử là đủ để kiểm chứng
+nguyên lý, nhưng chưa đủ để kết luận thống kê về tỷ lệ phát hiện
+tổng quát. Thực nghiệm trên tập lỗ hổng lớn hơn (hàng trăm CVE SSRF)
+sẽ cung cấp đánh giá tin cậy hơn.
+
+\textbf{Phụ thuộc vào kết nối mạng từ container.} OOB server phải
+tiếp cận được từ container web. Trong môi trường production với tường
+lửa egress nghiêm ngặt, container web không thể kết nối ra ngoài và
+cơ chế OOB sẽ không hoạt động. Tuy nhiên đây là đặc điểm của môi
+trường kiểm thử cục bộ (fuzzing lab), không phải môi trường production.
+
+% ============================================================
+\section{Hướng Phát triển Tương lai}
+\label{sec:future}
+% ============================================================
+
+\textbf{Mở rộng sang ngôn ngữ khác.} Hướng tiếp cận tự nhiên nhất
+là xây dựng module hook tương đương cho Python (\texttt{urllib},
+\texttt{requests}, \texttt{httpx}), Node.js (\texttt{http},
+\texttt{https}, \texttt{fetch}), và Java (\texttt{HttpURLConnection},
+\texttt{OkHttpClient}). OOB server và logic phát hiện hai tầng có thể
+giữ nguyên; chỉ cần thay module hook theo ngôn ngữ mục tiêu.
+
+\textbf{Xử lý Stored SSRF.} Một hướng tiếp cận khả thi là theo dõi
+thư mục \texttt{oob-logs/} liên tục trong suốt quá trình fuzzing, kể
+cả sau khi request gốc đã kết thúc. Token được lưu vào
+\texttt{\_token\_map} với timestamp; nếu callback đến muộn, fuzzer
+có thể tra cứu token và liên kết với ứng viên gốc theo cơ chế
+\textit{deferred lookup} đã đặt nền trong thiết kế hiện tại.
+
+\textbf{Mở rộng sang các lớp lỗ hổng OOB khác.} Phương pháp tín hiệu
+OOB không chỉ áp dụng cho SSRF. Các lớp lỗ hổng khác có đặc điểm
+tương tự --- không để lại dấu vết trong response --- cũng có thể hưởng
+lợi: XXE với DNS exfiltration (\texttt{<!DOCTYPE x [<!ENTITY xxe
+SYSTEM "http://oob-server/...">]>}), SQL injection out-of-band
+(\texttt{LOAD\_FILE} hay DNS lookup trong MySQL), hay Log4Shell-style
+JNDI injection. Kiến trúc OOB server và cơ chế token đã xây dựng có
+thể được tái sử dụng trực tiếp.
+
+\textbf{Tăng cường bộ payload bypass.} Tập 21 biến thể hiện tại được
+xây dựng dựa trên các kỹ thuật bypass đã biết. Trong thực tế, mỗi
+framework và thư viện HTTP có hành vi URL parsing khác nhau, tạo ra
+các bypass mới liên tục. Hướng phát triển là tích hợp cơ sở dữ liệu
+bypass từ các nguồn như PayloadsAllTheThings và cập nhật bộ mutator
+tự động.
+
+\textbf{Tích hợp vào pipeline CI/CD.} Hiện tại hệ thống được chạy
+thủ công theo từng target. Một hướng thực tế là đóng gói thành một
+Docker image tự chứa có thể tích hợp trực tiếp vào pipeline CI/CD,
+tự động quét SSRF mỗi khi có pull request chạm tới code xử lý URL
+người dùng.
+
+\textbf{Báo cáo tự động với Proof-of-Concept.} Hiện tại \texttt{SSRFVulnCheck}
+ghi report dạng JSON thô. Một bước cải tiến là tự động tạo PoC request
+có thể tái hiện lỗ hổng (curl command với payload đúng), cùng với phân
+loại mức độ nghiêm trọng dựa trên sink function và mức xác thực yêu
+cầu, giúp triage nhanh cho security engineer.

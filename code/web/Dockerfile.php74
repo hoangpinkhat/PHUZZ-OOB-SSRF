@@ -1,0 +1,35 @@
+FROM php:7.4.13-apache
+
+# Debian Buster is EOL — point to archive mirror
+RUN sed -i 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' /etc/apt/sources.list && \
+    sed -i '/buster-updates/d' /etc/apt/sources.list
+
+RUN apt-get update -o Acquire::Check-Valid-Until=false && \
+    apt-get install -y --no-install-recommends vim git wget rsync default-mysql-client libpng-dev libicu-dev libjpeg-dev libfreetype6-dev libzip-dev sudo less curl zip iputils-ping dnsutils
+
+RUN docker-php-ext-configure bcmath
+RUN docker-php-ext-configure exif
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg
+RUN docker-php-ext-configure intl
+RUN docker-php-ext-configure pdo_mysql
+RUN docker-php-ext-configure mysqli
+RUN docker-php-ext-configure zip
+RUN docker-php-ext-install -j "$(nproc)" bcmath exif gd intl pdo_mysql mysqli zip opcache
+
+WORKDIR /var/www/
+
+# uopz 6.x for PHP 7.4 (7.x requires PHP 8)
+RUN pecl install uopz-6.1.2
+RUN pecl install pcov
+
+RUN rm /bin/sh && ln -s bash /bin/sh
+
+COPY ./configs/php.ini "$PHP_INI_DIR/php.ini"
+COPY ./configs/mpm_prefork.conf /etc/apache2/mods-available/mpm_prefork.conf
+COPY ./instrumentation/ /var/www/fuzzer/
+COPY ./entrypoint.sh /
+
+WORKDIR /var/www/html/
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/usr/sbin/apache2ctl", "-D", "FOREGROUND"]

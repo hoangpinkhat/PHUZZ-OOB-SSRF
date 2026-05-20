@@ -1,0 +1,179 @@
+name: phuzz-pikachu-ssrf
+
+# ============================================================================
+# PHUZZ × Pikachu SSRF test environment
+# ============================================================================
+#
+# Services
+# --------
+#   phuzz-oob      – OOB HTTP listener (172.20.0.10:8000) + dnsmasq
+#   phuzz-db       – MySQL 8
+#   phuzz-web      – Instrumented PHP 8 + Pikachu app
+#   phuzz-fuzzer-* – Fuzzer instances (one per SSRF endpoint)
+#
+# First-time setup
+# ----------------
+#   1. Clone Pikachu into code/web/applications/pikachu/
+#
+#        git clone https://github.com/zhuifengshaonianhanlu/pikachu \
+#            code/web/applications/pikachu
+#
+#      The directory must contain at minimum:
+#        inc/config.inc.php   – DB config (will be auto-patched)
+#        pikachu.sql          – DB schema + seed data
+#        vul/ssrf/ssrf_curl.php
+#        vul/ssrf/ssrf_fgc.php
+#
+#   2. Start the stack:
+#
+#        docker compose -f docker-compose.pikachu-ssrf.yml up --build
+#
+#   3. Watch fuzzer output:
+#
+#        docker compose -f docker-compose.pikachu-ssrf.yml logs -f phuzz-fuzzer-curl
+#        docker compose -f docker-compose.pikachu-ssrf.yml logs -f phuzz-fuzzer-fgc
+#
+#   4. Results are in ./fuzzer/output/fuzzer-{1,2}/
+#      SSRF hits appear as SSRF-<candidateID>.json
+# ============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # OOB listener — fixed IP 172.20.0.10
+  # --------------------------------------------------------------------------
+  phuzz-oob:
+    build:
+      context: ./oob
+      dockerfile: Dockerfile
+    volumes:
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8000:8000"
+    networks:
+      phuzz-net:
+        ipv4_address: 172.20.0.10
+
+  # --------------------------------------------------------------------------
+  # MySQL
+  # --------------------------------------------------------------------------
+  phuzz-db:
+    image: mysql:8
+    command: mysqld
+    environment:
+      MYSQL_DATABASE:      pikachu
+      MYSQL_USER:          user
+      MYSQL_PASSWORD:      password
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_HOST:     "%"
+    networks:
+      phuzz-net:
+        aliases:
+          - db
+
+  # --------------------------------------------------------------------------
+  # Web — Pikachu on instrumented PHP 8
+  # --------------------------------------------------------------------------
+  phuzz-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE:     pikachu
+      FUZZER_COVERAGE_PATH: /var/www/html/
+      FUZZER_COMPRESS:      0
+      REQUIRES_DB:          1
+    volumes:
+      - ./web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8080:80"
+    dns:
+      - 172.20.0.10
+    networks:
+      phuzz-net:
+        aliases:
+          - web
+    depends_on:
+      - phuzz-db
+      - phuzz-oob
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared-tmpfs/web-paths.txt"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 15s
+
+  # --------------------------------------------------------------------------
+  # Fuzzer #1 — ssrf_curl.php  (?url=  → curl_exec)
+  # --------------------------------------------------------------------------
+  phuzz-fuzzer-curl:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   1
+      FUZZER_CONFIG:    pikachu/ssrf_curl
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks:
+      - phuzz-net
+
+  # --------------------------------------------------------------------------
+  # Fuzzer #2 — ssrf_fgc.php  (?file=  → file_get_contents)
+  # --------------------------------------------------------------------------
+  phuzz-fuzzer-fgc:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   2
+      FUZZER_CONFIG:    pikachu/ssrf_fgc
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks:
+      - phuzz-net
+
+# ----------------------------------------------------------------------------
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type:   tmpfs
+      device: tmpfs
+      o:      "size=512m,uid=1000"
+
+  sync-tmpfs:
+    driver: local
+    driver_opts:
+      type:   tmpfs
+      device: tmpfs
+      o:      "size=256m,uid=1000"
+
+# ----------------------------------------------------------------------------
+networks:
+  phuzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

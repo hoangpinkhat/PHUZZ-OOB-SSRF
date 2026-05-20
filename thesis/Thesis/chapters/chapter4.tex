@@ -1,0 +1,549 @@
+\chapter{Thực nghiệm và Đánh giá}
+
+Chương này trình bày kết quả thực nghiệm của hệ thống đề xuất trên 14 ca
+kiểm thử, gồm tám ứng dụng lab và sáu CVE thực tế.
+Phần~\ref{sec:exp-env} mô tả môi trường và thiết lập thực nghiệm.
+Phần~\ref{sec:exp-targets} liệt kê toàn bộ mục tiêu.
+Phần~\ref{sec:exp-lab} trình bày kết quả nhóm lab.
+Phần~\ref{sec:exp-cve} phân tích từng CVE.
+Phần~\ref{sec:exp-summary} tổng hợp và đánh giá.
+
+% ============================================================
+\section{Môi trường Thực nghiệm}
+\label{sec:exp-env}
+% ============================================================
+
+\subsection{Cấu hình phần cứng và phần mềm}
+
+Toàn bộ thực nghiệm được thực hiện trên một máy tính với hệ điều hành
+Ubuntu 22.04 LTS, CPU Intel Core i7 thế hệ 12, RAM 32 GB. Mỗi ca kiểm
+thử được khởi tạo độc lập bằng lệnh:
+
+\begin{verbatim}
+docker compose -f docker-compose.<target>.yml up --build
+\end{verbatim}
+
+đảm bảo trạng thái sạch (clean state) trước mỗi lần chạy. Giới hạn
+thời gian tối đa là 600 giây mỗi ca kiểm thử. Bảng~\ref{tab:env} tóm
+tắt cấu hình môi trường.
+
+\begin{table}[h]{Cấu hình môi trường thực nghiệm}
+\label{tab:env}
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Thành phần} & \textbf{Chi tiết} \\
+\hline
+Hệ điều hành    & Ubuntu 22.04 LTS \\
+CPU             & Intel Core i7 thế hệ 12 \\
+RAM             & 32 GB \\
+Docker          & Docker Engine 24.x \\
+PHP web server  & Apache 2.4, PHP 7.4 / 8.2 (tùy target) \\
+Database        & MySQL 8 (khi cần) \\
+Giới hạn thời gian & 600 giây/ca kiểm thử \\
+Subnet Docker   & \texttt{172.20.0.0/24}, OOB server IP \texttt{172.20.0.10} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Cấu hình Fuzzer}
+
+Hệ thống sử dụng Phuzz mở rộng với \texttt{SSRFMutator} và
+\texttt{SSRFVulnCheck} đã tích hợp như mô tả ở Chương~3. Hai chế độ
+hoạt động được dùng tùy loại target:
+
+\begin{itemize}
+    \item \texttt{"ssrf\_only": true} --- toàn bộ đột biến dùng
+    \texttt{SSRFMutator} (21 biến thể OOB). Áp dụng cho các endpoint
+    nhận URL hoặc đường dẫn trực tiếp.
+    \item \texttt{"cmdi\_ssrf\_only": true} --- toàn bộ đột biến dùng
+    \texttt{CmdInjectionSSRFMutator} (10 biến thể shell injection). Áp
+    dụng cho các endpoint truyền tham số vào lệnh shell.
+\end{itemize}
+
+21 biến thể của \texttt{SSRFMutator} được tổ chức thành ba nhóm: biến
+thể IP-based (v0--v14, sử dụng IP 172.20.0.10 dưới các dạng mã hóa
+khác nhau), biến thể DNS-based (v15--v18, token nằm trong subdomain và
+được phân giải qua dnsmasq wildcard \texttt{*.oob}), và biến thể
+hostname-based (v19--v20, dùng hostname \texttt{oob.phuzz} được phân
+giải qua \texttt{extra\_hosts} trong Docker).
+
+\subsection{Đường cơ sở so sánh}
+
+Mỗi ca kiểm thử được chạy với hai cấu hình để xác định đóng góp của
+hệ thống đề xuất:
+
+\begin{itemize}
+    \item \textbf{Phuzz gốc (P)}: không có \texttt{SSRFMutator} /
+    \texttt{SSRFVulnCheck}; chỉ dùng tín hiệu coverage và exception.
+    \item \textbf{Phuzz+SSRF (P+S)}: bản mở rộng đầy đủ với tín hiệu
+    OOB.
+\end{itemize}
+
+Kết quả của Phuzz gốc trên toàn bộ 14 ca: \textbf{0 lỗ hổng SSRF được
+phát hiện} --- xác nhận thực nghiệm rằng tín hiệu exception và coverage
+không đủ để phát hiện Blind SSRF.
+
+% ============================================================
+\section{Danh sách Mục tiêu Thực nghiệm}
+\label{sec:exp-targets}
+% ============================================================
+
+Bảng~\ref{tab:lab-targets} và Bảng~\ref{tab:cve-targets} liệt kê toàn
+bộ 14 mục tiêu, phân loại theo nhóm lab và CVE.
+
+\begin{table}[h]{Danh sách ứng dụng lab được kiểm thử}
+\label{tab:lab-targets}
+\centering
+\small
+\begin{tabular}{|c|l|l|l|l|}
+\hline
+\textbf{STT} & \textbf{Ứng dụng} & \textbf{Endpoint (param)} & \textbf{Sink} & \textbf{Mutator} \\
+\hline
+L1 & XVWA \texttt{ssrf\_xspa}
+   & \texttt{POST img\_url=}
+   & \texttt{curl\_exec}
+   & SSRFMutator \\
+L2 & Pikachu SSRF (2 ep.)
+   & \texttt{GET ?url=} / \texttt{GET ?file=}
+   & \texttt{curl\_exec} / \texttt{fgc}
+   & SSRFMutator \\
+L3 & ssrf-lab (2 ep.)
+   & \texttt{POST handler=} (basic + bypass)
+   & \texttt{curl\_exec}
+   & SSRFMutator \\
+L4 & SSRF\_Vul\_Lab (2 ep.)
+   & \texttt{POST file=} (fgc + dns\_rebinding)
+   & \texttt{file\_get\_contents}
+   & SSRFMutator \\
+L5 & BTSLab SSRF
+   & \texttt{POST url=}
+   & \texttt{file\_get\_contents}
+   & SSRFMutator \\
+L6 & DVWA Cmd Inject.
+   & \texttt{POST ip=}
+   & \texttt{shell\_exec}
+   & CmdInjSSRF \\
+L7 & bWAPP RFI
+   & \texttt{GET ?language=}
+   & \texttt{include(http://)}
+   & SSRFMutator \\
+L8 & Mutillidae RFI
+   & \texttt{GET ?page=}
+   & \texttt{require\_once(http://)}
+   & SSRFMutator \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[h]{Sáu CVE được kiểm thử}
+\label{tab:cve-targets}
+\centering
+\small
+\begin{tabular}{|c|l|l|l|l|}
+\hline
+\textbf{STT} & \textbf{CVE} & \textbf{Ứng dụng} & \textbf{Endpoint} & \textbf{Sink} \\
+\hline
+C1 & CVE-2020-7071
+   & PHP \texttt{filter\_var} app
+   & \texttt{GET ?url=}
+   & \texttt{file\_get\_contents} \\
+C2 & CVE-2020-24148
+   & Import XML Feed (WP)
+   & \texttt{POST data=} (AJAX)
+   & \texttt{file\_get\_contents} \\
+C3 & CVE-2020-28975
+   & Canto 1.3.0 \texttt{tree.php}
+   & \texttt{GET ?subdomain=}
+   & \texttt{curl\_exec} \\
+C4 & CVE-2021-32682
+   & elFinder $<$ 2.1.59
+   & \texttt{GET ?url=}
+   & \texttt{file\_get\_contents} \\
+C5 & CVE-2022-1751
+   & WP Skitter Slideshow
+   & \texttt{GET ?image=}
+   & \texttt{getimagesize} \\
+C6 & CVE-2023-2249
+   & wpForo (WP)
+   & \texttt{POST image\_blob=}
+   & \texttt{file\_get\_contents} \\
+\hline
+\end{tabular}
+\end{table}
+
+Lưu ý: CVE-2020-28975 thuộc plugin Canto 1.3.0 có ba file PHP đều dễ
+bị tấn công theo cùng cơ chế --- \texttt{tree.php} (CVE-2020-28975),
+\texttt{detail.php} (CVE-2020-28976), \texttt{get.php}
+(CVE-2020-28977). Thực nghiệm kiểm thử đại diện qua \texttt{tree.php};
+hai file còn lại chia sẻ cùng vector tấn công và không cần kiểm thử
+riêng. CVE-2021-21311 (Adminer Elasticsearch) không được đưa vào do
+Adminer throw \texttt{TypeError} trên PHP 8.2 trước khi đạt tới code
+path SSRF.
+
+% ============================================================
+\section{Kết quả Nhóm Lab}
+\label{sec:exp-lab}
+% ============================================================
+
+\subsection{Kết quả tổng hợp}
+
+Bảng~\ref{tab:lab-results} trình bày kết quả phát hiện cho tám ứng dụng
+lab, bao gồm 11 endpoint-level test run (ba ứng dụng L2, L3, L4 mỗi
+ứng dụng có hai endpoint riêng biệt).
+
+\begin{table}[h]{Kết quả phát hiện SSRF trên nhóm lab}
+\label{tab:lab-results}
+\centering
+\small
+\begin{tabular}{|c|l|l|l|c|c|}
+\hline
+\textbf{ID} & \textbf{Ứng dụng} & \textbf{Biến thể phát hiện} & \textbf{Hook function} & \textbf{P+S} & \textbf{P} \\
+\hline
+L1 & XVWA ssrf\_xspa
+   & v0 (plain IP)
+   & \texttt{curl\_exec}
+   & \checkmark & \ding{55} \\
+L2 & Pikachu (2 ep.)
+   & v0 (cả 2 endpoint)
+   & \texttt{curl\_exec} / \texttt{fgc}
+   & \checkmark & \ding{55} \\
+L3 & ssrf-lab (2 ep.)
+   & v0 (basic), v1 (bypass)
+   & \texttt{curl\_exec}
+   & \checkmark & \ding{55} \\
+L4 & SSRF\_Vul\_Lab (2 ep.)
+   & v0 (fgc), v15 (dns)
+   & \texttt{file\_get\_contents}
+   & \checkmark & \ding{55} \\
+L5 & BTSLab SSRF
+   & v0 (plain IP)
+   & \texttt{file\_get\_contents}
+   & \checkmark & \ding{55} \\
+L6 & DVWA Cmd Inject.
+   & Ck (semicolon)
+   & \texttt{shell\_exec}
+   & \checkmark & \ding{55} \\
+L7 & bWAPP RFI
+   & v0 (plain IP)
+   & stream wrapper \texttt{http://}
+   & \checkmark & \ding{55} \\
+L8 & Mutillidae RFI
+   & v0 (plain IP)
+   & stream wrapper \texttt{http://}
+   & \checkmark & \ding{55} \\
+\hline
+\multicolumn{4}{|l|}{\textbf{Tổng (8 ứng dụng / 11 endpoint)}}
+   & \textbf{8/8} & \textbf{0/8} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Phân tích từng ứng dụng}
+
+\textbf{XVWA (L1).} XVWA SSRF XSPA (Cross-Site Port Attack) là mô-đun
+SSRF của ứng dụng eXtremely Vulnerable Web Application, trong đó tham
+số \texttt{img\_url} được truyền trực tiếp vào \texttt{curl\_exec} mà
+không có bất kỳ kiểm tra nào. Biến thể v0 (plain IP) kích hoạt hook
+ngay trong vòng lặp đầu tiên của fuzzer.
+
+\textbf{Pikachu (L2).} Pikachu có hai module SSRF riêng biệt đóng vai
+trò sanity check: \texttt{ssrf\_curl.php} nhận tham số \texttt{url} rồi
+truyền vào \texttt{curl\_exec}, và \texttt{ssrf\_fgc.php} nhận tham số
+\texttt{file} rồi truyền vào \texttt{file\_get\_contents}. Cả hai
+endpoint không có cơ chế lọc, đều phát hiện với v0. Trường hợp này xác
+nhận rằng hai sink function phổ biến nhất (\texttt{curl\_exec} và
+\texttt{file\_get\_contents}) đều được hook và phát hiện đúng.
+
+\textbf{ssrf-lab (L3).} ssrf-lab cung cấp hai endpoint trên cùng file
+\texttt{testhook.php}: endpoint \textit{basic} (không có filter) và
+endpoint \textit{advanced1} (có filter đơn giản dựa trên chuỗi IP).
+Endpoint basic phát hiện với v0. Endpoint advanced1 chặn các chuỗi chứa
+dạng IP thập phân phân cách dấu chấm (\texttt{172.x.x.x}); biến thể v1
+(decimal encoding: \texttt{http://2886795274:8000/<token>}, trong đó
+2886795274 = 172.20.0.10 dưới dạng số nguyên 32-bit) vượt qua filter và
+kích hoạt \texttt{curl\_exec}. Trường hợp này minh họa cơ chế bypass
+cơ bản nhất: filter kiểm tra chuỗi thay vì kiểm tra giá trị IP đã chuẩn
+hóa.
+
+\textbf{SSRF\_Vulnerable\_Lab (L4).} Ứng dụng có hai endpoint:
+\texttt{file\_get\_content.php} (endpoint fgc, không có filter) và
+\texttt{dns\_rebinding.php} (mô phỏng tình huống có cơ chế kiểm tra
+hostname). Endpoint fgc phát hiện với v0. Endpoint dns\_rebinding sử
+dụng biến thể v15 --- payload dạng \texttt{http://<token>.oob:8000/},
+trong đó token nằm trong subdomain; dnsmasq trong Docker network phân
+giải wildcard \texttt{*.oob $\rightarrow$ 172.20.0.10}, cho phép OOB
+callback đến đích mà không cần truyền IP nội bộ trực tiếp trong URL.
+Endpoint này được cấu hình với \texttt{request\_timeout: 15} giây để
+chờ DNS resolution hoàn tất.
+
+\textbf{BTSLab (L5).} BTSLab yêu cầu đăng nhập trước khi truy cập
+endpoint SSRF. Fuzzer sử dụng module \texttt{btslab\_requests} để tự
+động đăng nhập và lưu session cookie \texttt{PHPSESSID}, sau đó đột
+biến tham số \texttt{url} tại \texttt{/vulnerability/ssrf/ssrf.php}.
+Sink function là \texttt{file\_get\_contents}; phát hiện với v0.
+
+\textbf{DVWA Command Injection (L6).} Đây là trường hợp SSRF gián tiếp:
+endpoint thực thi \texttt{shell\_exec('ping -c 4 ' . \$target)} ---
+tham số \texttt{ip} do người dùng kiểm soát được nhúng trực tiếp vào
+lệnh shell. \texttt{CmdInjectionSSRFMutator} sinh payload semicolon:
+\texttt{127.0.0.1; curl http://172.20.0.10:8000/<token>}, khiến shell
+thực thi lệnh \texttt{curl} sau \texttt{ping}. Hook trên
+\texttt{shell\_exec} trong \texttt{08\_ssrf.php} ghi nhận lời gọi; OOB
+server nhận callback từ \texttt{curl}. Trường hợp này mở rộng phạm vi
+phát hiện sang lớp lỗ hổng kết hợp Command Injection và SSRF.
+
+\textbf{bWAPP RFI (L7) và Mutillidae RFI (L8).} Hai trường hợp Remote
+File Inclusion sử dụng language construct của PHP: \texttt{include(\$language)}
+trong bWAPP (\texttt{rlfi.php}, security level 0) và
+\texttt{require\_once(\$page)} trong Mutillidae (\texttt{index.php},
+security level 0). Language construct là cấu trúc ngôn ngữ, không thể
+hook bằng \texttt{uopz\_set\_hook}. Thay vào đó,
+\texttt{09\_ssrf\_stream.php} đăng ký lại PHP stream wrapper
+\texttt{http://}, chặn mọi lần PHP mở URL qua giao thức HTTP, kể cả từ
+\texttt{include} và \texttt{require\_once}. Biến thể v0 kích hoạt stream
+wrapper và OOB callback nhận được. Kết quả xác nhận lớp phát hiện qua
+stream wrapper là thành phần bổ sung không thể thiếu bên cạnh hook UOPZ.
+
+% ============================================================
+\section{Kết quả Nhóm CVE}
+\label{sec:exp-cve}
+% ============================================================
+
+\subsection{Kết quả tổng hợp}
+
+Bảng~\ref{tab:cve-results} tóm tắt kết quả phát hiện cho sáu CVE.
+
+\begin{table}[h]{Kết quả phát hiện SSRF trên nhóm CVE}
+\label{tab:cve-results}
+\centering
+\small
+\begin{tabular}{|c|l|l|l|c|c|}
+\hline
+\textbf{ID} & \textbf{CVE} & \textbf{Biến thể phát hiện} & \textbf{Auth} & \textbf{P+S} & \textbf{P} \\
+\hline
+C1 & CVE-2020-7071  & v0 (plain IP)        & Không  & \checkmark & \ding{55} \\
+C2 & CVE-2020-24148 & v0 (plain IP)        & Admin  & \checkmark & \ding{55} \\
+C3 & CVE-2020-28975 & v20 (scheme-less)    & Không  & \checkmark & \ding{55} \\
+C4 & CVE-2021-32682 & v19 (hostname)       & Không  & \checkmark & \ding{55} \\
+C5 & CVE-2022-1751  & v0 (plain IP)        & Không  & \checkmark & \ding{55} \\
+C6 & CVE-2023-2249  & v0 (plain IP)        & User   & \checkmark & \ding{55} \\
+\hline
+\multicolumn{4}{|l|}{\textbf{Tổng}} & \textbf{6/6} & \textbf{0/6} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{CVE-2020-7071 --- Bypass \texttt{filter\_var} trong PHP}
+
+Ứng dụng kiểm tra URL đầu vào bằng \texttt{filter\_var(\$url,
+FILTER\_VALIDATE\_URL)} trước khi truyền vào
+\texttt{file\_get\_contents}. Trên PHP 7.4.13 (phiên bản có lỗi
+CVE-2020-7071), \texttt{filter\_var} chấp nhận URL dạng
+\texttt{http://172.20.0.10/} là hợp lệ --- đây chính là nội dung của
+lỗ hổng: hàm kiểm tra URL không phân biệt địa chỉ nội bộ và địa chỉ
+công khai. Biến thể v0 (plain IP) vượt qua được kiểm tra này và kích
+hoạt OOB callback. Container web sử dụng \texttt{Dockerfile.php74} để
+đảm bảo đúng phiên bản PHP 7.4 có lỗi.
+
+\subsection{CVE-2020-24148 --- Import XML Feed (WordPress Plugin)}
+
+Plugin Import XML Feed $\leq$ 2.0.0 có endpoint AJAX
+\texttt{moove\_read\_xml} yêu cầu quyền admin nhưng không kiểm tra
+nonce. Fuzzer đăng nhập với tài khoản admin thông qua module session
+management của Phuzz, rồi đột biến tham số \texttt{data} với payload
+OOB. Sink function là \texttt{file\_get\_contents}; phát hiện với v0.
+Thời gian phát hiện đạt \textbf{$\approx$506 giây} --- cao nhất trong
+toàn bộ thực nghiệm, chủ yếu do overhead từ WordPress bootstrap (khởi
+động MySQL và WordPress init sequence) và quá trình xác thực admin. Với
+giới hạn 600 giây, biên độ an toàn không lớn; đây cũng là một trong
+các hạn chế được thảo luận ở Chương~5.
+
+\subsection{CVE-2020-28975 --- Canto 1.3.0 WordPress Plugin}
+
+Plugin Canto 1.3.0 xây dựng URL theo mẫu cứng
+\texttt{https://\{subdomain\}.\{app\_api\}/api/v1/...} rồi gọi cURL
+với \texttt{CURLOPT\_SSL\_VERIFYPEER = false}. Đây là trường hợp đặc
+biệt: các biến thể IP-based (v0--v14) đều không hoạt động vì IP được
+nhúng vào vị trí subdomain tạo ra URL dạng
+\texttt{https://172.20.0.10.x/...} --- chuỗi này không hợp lệ về mặt
+DNS và cURL thất bại ở bước phân giải.
+
+Hệ thống phát hiện qua \textbf{biến thể v20} (scheme-less:
+\texttt{oob.phuzz:8443/<token>\#}): khi Canto nhận
+\texttt{subdomain = "oob.phuzz:8443/<token>\#"}, URL được xây dựng
+thành \texttt{https://oob.phuzz:8443/<token>\#.x/api/v1/...}. cURL
+phân tích \texttt{oob.phuzz:8443} là host và \texttt{/<token>} là path;
+phần sau \texttt{\#} là fragment bị bỏ qua. Entry \texttt{extra\_hosts}
+trong Docker phân giải \texttt{oob.phuzz $\rightarrow$ 172.20.0.10}; OOB
+HTTPS listener (cổng 8443, SSL verification disabled) nhận callback và
+ghi log.
+
+\subsection{CVE-2021-32682 --- elFinder $<$ 2.1.59}
+
+elFinder triển khai kiểm tra địa chỉ IP nội bộ (RFC~1918) trong hàm
+\texttt{get\_remote\_contents()} bằng regex trên chuỗi URL. Các biến
+thể IP trực tiếp (plain, decimal, hex, octal, IPv6) đều bị chặn tại
+tầng kiểm tra chuỗi này trước khi đến \texttt{file\_get\_contents}.
+
+Hệ thống phát hiện qua \textbf{biến thể v19}
+(\texttt{http://oob.phuzz:8000/<token>}): hostname \texttt{oob.phuzz}
+không khớp với bất kỳ pattern RFC~1918 nào trong regex của elFinder,
+nên \texttt{file\_get\_contents} được gọi với URL này. Entry
+\texttt{extra\_hosts} trong Docker phân giải
+\texttt{oob.phuzz $\rightarrow$ 172.20.0.10} ở tầng OS; OOB server nhận
+callback. Đây là ví dụ điển hình của kỹ thuật bypass
+\textit{hostname indirection}: cơ chế lọc kiểm tra biểu diễn chuỗi của
+URL thay vì kiểm tra địa chỉ IP thực sự sau DNS resolution.
+
+\subsection{CVE-2022-1751 --- WP Skitter Slideshow}
+
+Plugin \texttt{wp-skitter-slideshow} gọi
+\texttt{getimagesize(\$\_GET['image'])} trực tiếp trên URL người dùng
+cung cấp trong file \texttt{image.php} mà không qua WordPress bootstrap.
+\texttt{getimagesize} là hàm xử lý ảnh, không phải hàm mạng điển hình,
+nhưng PHP triển khai nó với khả năng fetch URL từ xa qua HTTP wrapper
+khi đối số là URL bắt đầu bằng \texttt{http://}. Trường hợp này xác
+nhận tầm quan trọng của việc hook đủ rộng: nhóm Network/HTTP trong
+\texttt{08\_ssrf.php} bao gồm \texttt{getimagesize} bên cạnh
+\texttt{file\_get\_contents} và các hàm mạng thông thường. Biến thể v0
+kích hoạt OOB callback mà không yêu cầu xác thực. Plugin đã bị đóng
+trên WordPress.org; mã nguồn lấy từ GitHub mirror.
+
+\subsection{CVE-2023-2249 --- wpForo Profile Cover Upload}
+
+Plugin wpForo $\leq$ 2.1.7 cho phép thành viên đã đăng nhập ở mức
+Subscriber cập nhật ảnh bìa profile bằng URL. Endpoint AJAX
+\texttt{wpforo\_upload\_remote\_image} fetch URL ảnh phía server thông
+qua \texttt{file\_get\_contents} mà không kiểm tra địa chỉ đích. Fuzzer
+đăng nhập với tài khoản subscriber (\texttt{subscriber1/subscriber1}),
+rồi đột biến tham số \texttt{image\_blob} với v0. Đây là SSRF
+\textit{authenticated} ở mức quyền thấp nhất, xác nhận hệ thống xử lý
+đúng session management cấp user thông thường bên cạnh cấp admin.
+
+% ============================================================
+\section{Tổng hợp và Đánh giá}
+\label{sec:exp-summary}
+% ============================================================
+
+\subsection{Kết quả tổng thể}
+
+Bảng~\ref{tab:overall} tổng hợp kết quả trên toàn bộ 14 ca kiểm thử.
+
+\begin{table}[h]{Tổng hợp kết quả theo nhóm}
+\label{tab:overall}
+\centering
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Nhóm} & \textbf{Tổng ca} & \textbf{P+S phát hiện} & \textbf{P phát hiện} & \textbf{FP} \\
+\hline
+Lab (8 ứng dụng, 11 endpoint) & 8  & 8 (100\%) & 0 & 0 \\
+CVE                            & 6  & 6 (100\%) & 0 & 0 \\
+\hline
+\textbf{Tổng}                 & \textbf{14} & \textbf{14 (100\%)} & \textbf{0} & \textbf{0} \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[h]{Phân bố sink function được kích hoạt}
+\label{tab:sinks}
+\centering
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Sink function} & \textbf{Số run} & \textbf{Nhóm hook} \\
+\hline
+\texttt{file\_get\_contents}                      & 8  & Network/HTTP (\texttt{08\_ssrf.php}) \\
+\texttt{curl\_exec}                                & 5  & cURL (\texttt{08\_ssrf.php}) \\
+\texttt{include} / \texttt{require\_once} (stream) & 2  & Stream wrapper (\texttt{09\_ssrf\_stream.php}) \\
+\texttt{shell\_exec}                               & 1  & Shell Execution (\texttt{08\_ssrf.php}) \\
+\texttt{getimagesize}                              & 1  & Network/HTTP (\texttt{08\_ssrf.php}) \\
+\hline
+\textbf{Tổng}                                     & \textbf{17} & \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[h]{Phân bố biến thể bypass được sử dụng}
+\label{tab:variants}
+\centering
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Biến thể} & \textbf{Số run} & \textbf{Áp dụng cho} \\
+\hline
+v0  (plain IP \texttt{172.20.0.10})
+  & 12 & L1, L2$\times$2, L3-basic, L4-fgc, L5, L7, L8, C1, C2, C5, C6 \\
+v1  (decimal IP \texttt{2886795274})
+  & 1  & L3-advanced1 (bypass filter chuỗi IP) \\
+v15 (DNS: \texttt{<token>.oob:8000/})
+  & 1  & L4-dns\_rebinding \\
+v19 (hostname: \texttt{oob.phuzz:8000/<token>})
+  & 1  & C4 (elFinder, bypass RFC~1918 regex) \\
+v20 (scheme-less: \texttt{oob.phuzz:8443/<token>\#})
+  & 1  & C3 (Canto, bypass URL template) \\
+Ck  (semicolon cmd inj.)
+  & 1  & L6 (DVWA \texttt{shell\_exec}) \\
+\hline
+\textbf{Tổng} & \textbf{17} & \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Phân tích kết quả}
+
+\textbf{Tỷ lệ phát hiện và False Positive.}
+Hệ thống đề xuất đạt tỷ lệ phát hiện \textbf{14/14 (100\%)} trên toàn
+bộ 14 ca kiểm thử, với tỷ lệ false positive bằng 0. Mỗi báo cáo đều
+có đủ hai file bằng chứng (\texttt{ssrf-hooks/<ID>.json} và
+\texttt{oob-logs/<token>.json}), xác nhận ứng dụng đã thực sự thực
+hiện kết nối mạng tới OOB server. Ngược lại, Phuzz gốc không phát hiện
+được bất kỳ trường hợp nào (0/14), khẳng định thực nghiệm rằng tín
+hiệu coverage và exception hoàn toàn bất lực trước Blind SSRF.
+
+\textbf{Tầm quan trọng của đa biến thể bypass.}
+Bảng~\ref{tab:variants} cho thấy biến thể plain IP (v0) chiếm đa số
+(12/17 run), nhưng năm run còn lại chỉ phát hiện được qua biến thể
+đặc thù: Canto (C3) cần v20 do cơ chế xây dựng URL template; elFinder
+(C4) cần v19 để bypass kiểm tra chuỗi RFC~1918; ssrf-vul-lab
+dns\_rebinding cần v15 (DNS-based) để hoạt động trong môi trường có
+DNS resolution; ssrf-lab advanced1 cần v1 để bypass filter chuỗi IP;
+DVWA cần \texttt{CmdInjectionSSRFMutator}. Nếu hệ thống chỉ có biến
+thể plain IP, tỷ lệ phát hiện sẽ giảm từ 100\% xuống khoảng 71\%
+(12/17 run) ở mức endpoint và còn thấp hơn ở mức ứng dụng.
+
+\textbf{Tầm quan trọng của hook rộng.}
+Bảng~\ref{tab:sinks} cho thấy năm loại sink function khác nhau được
+kích hoạt. Đặc biệt, \texttt{getimagesize} (C5) và cặp
+\texttt{include}/\texttt{require\_once} qua stream wrapper (L7, L8) là
+những sink không trực quan mà hầu hết công cụ bảo mật không theo dõi.
+Phát hiện CVE-2022-1751 là bằng chứng rõ ràng: nếu thiếu hook
+\texttt{getimagesize}, lỗ hổng này sẽ bị bỏ sót hoàn toàn. Tương tự,
+nếu chỉ có hook UOPZ mà thiếu stream wrapper, bWAPP (L7) và Mutillidae
+(L8) --- hai trường hợp RFI qua language construct --- sẽ không được
+phát hiện.
+
+\textbf{SSRF gián tiếp qua Command Injection (L6).}
+DVWA là ví dụ về SSRF gián tiếp: tham số đầu vào không đi vào hàm
+mạng mà đi vào shell command. \texttt{CmdInjectionSSRFMutator} và hook
+nhóm Shell Execution xử lý đúng kịch bản này, mở rộng phạm vi phát
+hiện sang lớp lỗ hổng kết hợp Command Injection và SSRF.
+
+\textbf{Xác thực đa mức.}
+Thực nghiệm bao phủ ba mức xác thực: không cần đăng nhập (L1--L4, C1,
+C3--C5), đăng nhập user thông thường (L5--L8, C6), và đăng nhập admin
+(C2). Trong tất cả trường hợp yêu cầu xác thực, module session
+management của Phuzz xử lý đúng quy trình đăng nhập và duy trì session
+cho các request tiếp theo, không làm gián đoạn vòng lặp fuzzing.
+
+\section{Tổng kết Chương}
+
+Thực nghiệm trên 14 ca kiểm thử (8 ứng dụng lab với tổng cộng 11
+endpoint, 6 CVE) cho thấy hệ thống đề xuất đạt tỷ lệ phát hiện 100\%
+với 0 false positive, trong khi Phuzz gốc không phát hiện được bất kỳ
+trường hợp nào. Kết quả đặc biệt đáng chú ý gồm: (1) Canto (C3) và
+elFinder (C4) chỉ phát hiện được qua biến thể đặc thù (scheme-less và
+hostname indirection), đòi hỏi tập biến thể đa dạng hơn plain IP; (2)
+CVE-2022-1751 kích hoạt sink \texttt{getimagesize} --- hàm ảnh không
+được hầu hết công cụ coi là điểm SSRF; (3) bWAPP (L7) và Mutillidae
+(L8) chứng minh sự cần thiết của lớp phát hiện qua stream wrapper bên
+cạnh hook UOPZ. Chương~5 tổng kết đóng góp và thảo luận hướng phát
+triển.

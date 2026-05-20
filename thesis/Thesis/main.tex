@@ -1,0 +1,334 @@
+﻿\documentclass{uetgraduation}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{fancyvrb}
+\usepackage{amssymb}
+\usepackage{pifont}
+\usepackage[hidelinks]{hyperref}
+\graphicspath{{figures/}}   % must be loaded LAST; unicode auto-set by LuaLaTeX
+\RecustomVerbatimEnvironment{verbatim}{Verbatim}{fontsize=\small}
+\setlength{\emergencystretch}{3em}
+\hbadness=10001
+
+% uetgraduation.cls redefines \bibitem without creating a hyperref anchor target,
+% so clicking citation numbers in text does not navigate to the bibliography.
+% Fix: patch \bibitem to add \hypertarget{cite.<key>}{} — exactly what \cite{} links to.
+\makeatletter
+\renewcommand{\bibitem}[1]{%
+  \if@inbibsection\else
+    \PackageError{uetgraduation}{`bibitem` not in `bibsection`.}{}%
+  \fi
+  \item
+  \hypertarget{cite.#1}{}%
+  \if@filesw\immediate\write\@auxout{\string\bibcite{#1}{\the\value{\@listctr}}}\fi
+  \ignorespaces
+}
+\makeatother
+\begin{document}
+
+
+\studentname{Trần Huy Hoàng}
+\title{Nâng cao khả năng phát hiện lỗ hổng SSRF cho hệ thống grey-box fuzzing thông qua phân tích tương tác out-of-band}
+\documenttype{Khóa luận tốt nghiệp đại học hệ chính quy}
+\major{Khoa học máy tính}
+\year{2026}
+\supervisor{TS. Lê Đình Thanh}
+\makecovers
+
+
+\newenvironment{changemargin}[2]{%
+  \begin{list}{}{%
+    \setlength{\leftmargin}{#1}%
+    \setlength{\rightmargin}{#2}%
+  }%
+  \item[]}{\end{list}}
+
+\begin{preamble}{Lời cảm ơn}
+Lời đầu tiên, tôi xin gửi lời cảm ơn chân thành và lòng biết ơn sâu sắc
+tới thầy TS. Lê Đình Thanh, người đã tận tình hướng dẫn, định hướng nghiên cứu
+và động viên tôi trong suốt quá trình thực hiện khóa luận này. Sự chỉ bảo tâm
+huyết và những góp ý quý báu của thầy là nền tảng quan trọng giúp tôi
+hoàn thành công trình.
+
+Tôi cũng xin bày tỏ lòng biết ơn chân thành tới toàn thể các thầy, cô
+đang công tác và giảng dạy tại trường Đại học Công Nghệ --- Đại học Quốc gia
+Hà Nội. Những kiến thức và kỹ năng mà các thầy cô đã truyền đạt trong suốt
+những năm học vừa qua chính là hành trang vững chắc để tôi thực hiện
+nghiên cứu này.
+
+Mặc dù đã cố gắng hết sức, khóa luận chắc chắn không tránh khỏi những thiếu
+sót. Tôi rất mong nhận được sự góp ý từ các thầy cô và bạn đọc để công
+trình được hoàn thiện hơn.
+
+\begin{flushright}
+Hà Nội, ngày \ldots\ tháng \ldots\ năm 2026 \\[0.5cm]
+Sinh viên \\[2cm]
+Trần Huy Hoàng
+\end{flushright}
+\end{preamble}
+
+
+\begin{preamble}{Lời cam đoan}
+Tôi là Trần Huy Hoàng, sinh viên theo học ngành Khoa học máy tính tại trường
+Đại học Công Nghệ --- Đại học Quốc gia Hà Nội. Tôi xin cam đoan công trình
+\textit{``Nâng cao khả năng phát hiện lỗ hổng SSRF cho hệ thống grey-box fuzzing
+thông qua phân tích tương tác out-of-band''} là công
+trình nghiên cứu do bản thân tôi thực hiện. Các nội dung nghiên cứu, kết quả
+trong nghiên cứu khoa học là trung thực và xác thực.
+
+Các thông tin sử dụng trong khóa luận đều có cơ sở rõ ràng và không có nội dung
+nào sao chép từ các tài liệu mà không ghi rõ trích dẫn tham khảo. Tôi xin chịu
+trách nhiệm hoàn toàn về lời cam đoan này.
+
+\begin{flushright}
+Hà Nội, ngày \ldots\ tháng \ldots\ năm 2026 \\[0.5cm]
+Sinh viên \\[2cm]
+Trần Huy Hoàng
+\end{flushright}
+\end{preamble}
+
+
+
+\begin{preamble}{Tóm tắt}
+\textbf{Tóm tắt:} Lỗ hổng Server-Side Request Forgery (SSRF) là một trong những
+mối đe dọa bảo mật nghiêm trọng trong các ứng dụng web hiện đại, cho phép kẻ
+tấn công ép buộc máy chủ thực hiện các yêu cầu mạng tùy ý đến các hệ thống
+nội bộ vốn được bảo vệ bởi tường lửa. Đặc biệt, dạng Blind SSRF --- trong đó
+máy chủ âm thầm gửi request ra ngoài mà không để lại bất kỳ dấu hiệu lỗi nào
+quan sát được --- đặt ra thách thức lớn cho các công cụ kiểm thử tự động hiện
+có, vốn phụ thuộc vào tín hiệu exception và độ phủ mã làm cơ sở phản hồi.
+Khoảng trống này khiến một lớp lỗ hổng nghiêm trọng bị bỏ sót hoàn toàn trong
+quá trình kiểm thử tự động.
+
+Khóa luận này đề xuất một hướng tiếp cận mới nhằm nâng cao khả năng phát hiện
+Blind SSRF bằng cách tích hợp kênh tín hiệu Out-of-Band (OOB) bất đồng bộ vào
+vòng lặp greybox fuzzing. Thay vì chờ đợi ứng dụng báo lỗi, hệ thống triển
+khai một máy chủ lắng nghe bên ngoài để ghi nhận các callback mà ứng dụng mục
+tiêu chủ động gửi đến khi bị kích hoạt bởi payload SSRF. Tín hiệu OOB thu được
+được đưa trở lại vòng lặp fuzzing như một kênh phản hồi độc lập, bổ sung cho
+các tín hiệu truyền thống và cho phép fuzzer nhận biết các đầu vào kích hoạt
+hành vi mạng bất thường mà trước đây không thể quan sát được.
+
+Hệ thống được xây dựng với các thành phần chính bao gồm bộ đột biến payload
+đặc thù cho SSRF tích hợp nhiều kỹ thuật bypass phổ biến, cơ chế hook các hàm
+mạng phía máy chủ để thu thập tín hiệu bổ sung, và module xác nhận lỗ hổng dựa
+trên cơ chế tương quan token OOB. Cơ chế này đảm bảo mỗi lỗ hổng được xác nhận
+chỉ khi có bằng chứng mạng thực tế, loại trừ hoàn toàn khả năng phát sinh dương
+tính giả.
+
+Kết quả thực nghiệm trên các ứng dụng có lỗ hổng đã biết và các lỗ hổng thực
+tế được công bố cho thấy hệ thống đề xuất có khả năng phát hiện Blind SSRF hiệu
+quả trong khi các công cụ greybox fuzzing truyền thống hoàn toàn bỏ sót. Kết
+quả này khẳng định rằng việc mở rộng kênh tín hiệu phản hồi là hướng tiếp cận
+khả thi và có tiềm năng ứng dụng rộng hơn cho các lớp lỗ hổng bảo mật có đặc
+điểm tương tự.
+
+\textit{\textbf{Từ khóa:} SSRF, Blind SSRF, Greybox Fuzzing, Out-of-Band,
+Kiểm thử bảo mật web tự động.}
+\end{preamble}
+
+
+\begin{contentlisting}
+
+\tableofcontents
+
+\listoffigures
+
+\listoftables
+
+\end{contentlisting}
+
+
+% Phần mở đầu
+\include{chapters/chapter1}
+\include{chapters/chapter2}
+\include{chapters/chapter3}
+\include{chapters/chapter4}
+\include{chapters/chapter5}
+
+% ============================================================
+%  Tài liệu tham khảo
+% ============================================================
+\begin{thebibliography}{99}
+
+\begin{bibsection}{Conference and Journal Papers}
+
+\bibitem{miller1990empirical}
+B.~P. Miller, L.~Fredriksen, and B.~So,
+An Empirical Study of the Reliability of {UNIX} Utilities,''
+\textit{Communications of the ACM}, vol.~33, no.~12, pp.~32--44,
+Dec. 1990, doi: 10.1145/96267.96279.
+
+\bibitem{neef2024phuzz}
+S.~Neef, L.~Kleissner, and J.-P.~Seifert,
+What All the {Phuzz} Is About: A Coverage-guided Fuzzer for Finding
+Vulnerabilities in {PHP} Web Applications,''
+in \textit{Proc. ACM Asia Conf. Computer and Communications Security
+(AsiaCCS '24)}, Singapore, Jul. 2024.
+
+\bibitem{fioraldi2020afl}
+A.~Fioraldi, D.~Maier, H.~Ei{\ss}feldt, and M.~Heuse,
+{AFL++}: Combining Incremental Steps of Fuzzing Research,''
+in \textit{Proc. 14th USENIX Workshop Offensive Technologies (WOOT '20)},
+USENIX Association, Aug. 2020.
+
+\bibitem{bohme2016coverage}
+M.~B{"o}hme, V.-T.~Pham, and A.~Roychoudhury,
+Coverage-based Greybox Fuzzing as Markov Chain,''
+in \textit{Proc. 23rd ACM SIGSAC Conf. Computer and Communications
+Security (CCS '16)}, ACM, Oct. 2016, pp.~1032--1043,
+doi: 10.1145/2976749.2978428.
+
+\bibitem{vanrooij2021webfuzz}
+O.~van Rooij, M.~A.~Charalambous, D.~Kaizer, M.~Papaevripides,
+and E.~Athanasopoulos,
+{webFuzz}: Grey-Box Fuzzing for Web Applications,''
+in \textit{Computer Security -- ESORICS 2021}, Lecture Notes in
+Computer Science, vol.~12972, Springer, Oct. 2021, pp.~152--172,
+doi: 10.1007/978-3-030-88418-5\_8.
+
+\bibitem{trickel2023witcher}
+E.~Trickel \textit{et al.},
+Toss a Fault to Your Witcher: Applying Grey-box Coverage-guided
+Mutational Fuzzing to Detect {SQL} and Command Injection Vulnerabilities,''
+in \textit{Proc. 44th IEEE Symp. Security and Privacy (S\&P)},
+IEEE, May 2023, pp.~116--133,
+doi: 10.1109/SP46215.2023.10179419.
+
+\bibitem{li2018fuzzing}
+J.~Li, B.~Zhao, and C.~Zhang,
+Fuzzing: A Survey,''
+\textit{Cybersecurity}, vol.~1, no.~1, pp.~1--13, Dec. 2018,
+doi: 10.1186/s42400-018-0002-y.
+
+\bibitem{manes2021art}
+V.~J.~M.~Manes \textit{et al.},
+The Art, Science, and Engineering of Fuzzing: A Survey,''
+\textit{IEEE Trans. Software Engineering}, vol.~47, no.~11,
+pp.~2312--2331, Nov. 2021, doi: 10.1109/TSE.2019.2946563.
+
+\bibitem{zhu2022fuzzing}
+X.~Zhu, S.~Wen, S.~Camtepe, and Y.~Xiang,
+Fuzzing: A Survey for Roadmap,''
+\textit{ACM Computing Surveys}, vol.~54, no.~11s, art. 230, Sep. 2022,
+doi: 10.1145/3512345.
+
+\bibitem{godefroid2008automated}
+P.~Godefroid, M.~Y.~Levin, and D.~A.~Molnar,
+Automated Whitebox Fuzz Testing,''
+in \textit{Proc. 15th Network and Distributed System Security Symp.
+(NDSS '08)}, Internet Society, Feb. 2008, pp.~151--166.
+
+\bibitem{ganesh2009taint}
+V.~Ganesh, T.~Leek, and M.~Rinard,
+Taint-based Directed Whitebox Fuzzing,''
+in \textit{Proc. 31st IEEE/ACM Int. Conf. Software Engineering
+(ICSE '09)}, IEEE, May 2009, pp.~474--484,
+doi: 10.1109/ICSE.2009.5070546.
+
+\bibitem{godefroid2007random}
+P.~Godefroid,
+Random Testing for Security: Blackbox vs.\ Whitebox Fuzzing,''
+in \textit{Proc. 2nd Int. Workshop on Random Testing (RT '07)},
+ACM, 2007, p.~1, doi: 10.1145/1292414.1292416.
+
+\bibitem{doupe2010johnny}
+A.~Doup{\'e}, M.~Cova, and G.~Vigna,
+Why Johnny Can't Pentest: An Analysis of Black-box Web Vulnerability
+Scanners,''
+in \textit{Proc. 7th Int. Conf. Detection of Intrusions and Malware,
+and Vulnerability Assessment (DIMVA '10)}, Lecture Notes in Computer
+Science, vol.~6201, Springer, Jul. 2010, pp.~111--131,
+doi: 10.1007/978-3-642-14215-4\_7.
+
+\end{bibsection}
+
+\begin{bibsection}{Standards and Technical Guidelines}
+
+\bibitem{owasp2021top10}
+OWASP Foundation,
+{OWASP} Top 10:2021 --- The Ten Most Critical Web Application
+Security Risks,'' OWASP Foundation, Sep. 2021.
+[Online]. Available: \url{https://owasp.org/Top10/}
+
+\bibitem{owasp2023ssrf}
+OWASP Foundation,
+Server-Side Request Forgery Prevention Cheat Sheet,''
+OWASP Foundation, 2023.
+[Online]. Available: \url{https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html}
+
+\end{bibsection}
+
+\begin{bibsection}{Software and Tools}
+
+\bibitem{zalewski2014afl}
+M.~Zalewski,
+{American Fuzzy Lop (AFL)}: A Security-oriented Fuzzer,''
+Google, 2014.
+[Online]. Available: \url{https://lcamtuf.coredump.cx/afl/}
+
+\bibitem{google2023honggfuzz}
+Google,
+Honggfuzz: A Security-oriented, Feedback-driven, Evolutionary,
+Easy-to-use Fuzzer,'' Google LLC, 2023.
+[Online]. Available: \url{https://github.com/google/honggfuzz}
+
+\bibitem{portswigger2023burp}
+PortSwigger,
+Burp Suite --- The Industry Standard Tool for Web Application
+Security Testing,'' PortSwigger Ltd., 2023.
+[Online]. Available: \url{https://portswigger.net/burp}
+
+\bibitem{zapdevteam2023}
+OWASP ZAP Dev Team,
+{OWASP ZAP (Zed Attack Proxy)} --- The World's Most Widely Used
+Web App Scanner,'' OWASP Foundation, 2023.
+[Online]. Available: \url{https://www.zaproxy.org/}
+
+\bibitem{rethans2002xdebug}
+D.~Rethans,
+{Xdebug}: Debugger and Profiler Tool for {PHP},''
+2002 (updated 2024).
+[Online]. Available: \url{https://xdebug.org/}
+
+\bibitem{watkins2023pcov}
+J.~Watkins,
+{PCOV}: A Code Coverage Driver for {PHP},'' GitHub, 2023.
+[Online]. Available: \url{https://github.com/krakjoe/pcov}
+
+\bibitem{phpgroup2023uopz}
+The PHP Group,
+{UOPZ (User Operations for Zend Engine)} --- {PHP} Manual,''
+The PHP Group, 2023.
+[Online]. Available: \url{https://www.php.net/manual/en/book.uopz.php}
+
+\bibitem{phpgroup2023history}
+The PHP Group,
+{PHP}: History of {PHP},''
+The PHP Group, 2023.
+[Online]. Available: \url{https://www.php.net/manual/en/history.php.php}
+
+\bibitem{w3techs2023php}
+Q-Success Web-Quality GmbH,
+Usage Statistics and Market Share of {PHP} for Websites,''
+W3Techs --- Web Technology Surveys, 2023.
+[Online]. Available: \url{https://w3techs.com/technologies/details/pl-php}
+
+\bibitem{docker2023}
+Docker Inc.,
+Docker: Accelerated, Containerized Application Development,''
+Docker Inc., 2023.
+[Online]. Available: \url{https://www.docker.com/}
+
+\bibitem{microsoft2024playwright}
+Microsoft,
+Playwright --- Fast and Reliable End-to-End Testing for Modern
+Web Apps,'' Microsoft Corporation, 2024.
+[Online]. Available: \url{https://playwright.dev/}
+
+\end{bibsection}
+
+\end{thebibliography}
+
+\end{document}
+

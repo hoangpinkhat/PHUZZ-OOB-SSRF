@@ -1,0 +1,106 @@
+name: phuzz-ssrf-vlab
+
+# App: SSRF_Vulnerable_Lab
+# Endpoints:
+#   POST /file_get_content.php  → file_get_contents()
+#   POST /dns_rebinding.php     → file_get_contents()
+# No MySQL needed
+
+services:
+  phuzz-oob:
+    build:
+      context: ./oob
+      dockerfile: Dockerfile
+    volumes:
+      - shared-tmpfs:/shared-tmpfs
+    networks:
+      phuzz-net:
+        ipv4_address: 172.20.0.10
+
+  phuzz-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE:     ssrf-vulnerable-lab
+      FUZZER_COVERAGE_PATH: /var/www/html/
+      FUZZER_COMPRESS:      0
+      REQUIRES_DB:          0
+    volumes:
+      - ./web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8080:80"
+    dns: [172.20.0.10]
+    networks:
+      phuzz-net:
+        aliases: [web]
+    depends_on: [phuzz-oob]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared-tmpfs/web-paths.txt"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  phuzz-fuzzer-fgc:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   1
+      FUZZER_CONFIG:    ssrf-vulnerable-lab/fgc
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks: [phuzz-net]
+
+  phuzz-fuzzer-dns-rebinding:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   3
+      FUZZER_CONFIG:    ssrf-vulnerable-lab/dns_rebinding
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks: [phuzz-net]
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000"
+  sync-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=256m,uid=1000"
+
+networks:
+  phuzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

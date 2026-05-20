@@ -414,6 +414,9 @@ class WebPathBasedPathTraversalVulnCheck(VulnCheck):
                     continue
                 if error_param in self.web_paths:
                     continue
+                # Skip URL-like params — these are SSRF probes, not path traversal
+                if error_param.startswith(('http://', 'https://', 'ftp://')):
+                    continue
                 for vuln_type in candidate.fuzz_params.keys():
                     for pkey, pval in candidate.fuzz_params[vuln_type].items():
                         if pval in error_param:

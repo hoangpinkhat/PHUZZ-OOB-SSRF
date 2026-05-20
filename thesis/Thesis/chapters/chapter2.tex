@@ -1,0 +1,713 @@
+﻿\chapter{Phát hiện lỗ hổng ứng dụng web bằng phương pháp Greybox fuzzing}
+
+
+Chương này trình bày các kiến thức nền tảng cần thiết để hiểu rõ bài toán
+và đánh giá giải pháp đề xuất trong khóa luận.
+Phần~\ref{sec:greybox-fuzzing} giới thiệu kỹ thuật greybox fuzzing, lịch sử
+phát triển và những thách thức đặc thù khi áp dụng lên ứng dụng web PHP.
+Phần~\ref{sec:phuzz} mô tả kiến trúc, cơ chế hoạt động và công thức đánh giá
+ứng viên của framework Phuzz --- nền tảng mà khóa luận này mở rộng.
+Phần~\ref{sec:hooking} mô tả kiến trúc runtime của PHP, cơ chế hook hàm qua
+UOPZ và vai trò của phân tích động --- thành phần kỹ thuật cốt lõi để xây
+dựng kênh tín hiệu bổ sung cho SSRF.
+Phần~\ref{sec:problem-statement} nhận xét về khoảng trống kỹ thuật và phát
+biểu bài toán cần giải quyết.
+
+% ============================================================
+\section{Greybox Fuzzing}
+\label{sec:greybox-fuzzing}
+% ============================================================
+
+\subsection{Lịch sử và Bối cảnh Fuzz Testing}
+
+Fuzz testing (hay fuzzing) là kỹ thuật kiểm thử phần mềm tự động được đề
+xuất lần đầu bởi Barton Miller vào năm 1988 tại Đại học Wisconsin--Madison,
+khi ông nhận thấy rằng các chương trình Unix bị crash khi nhận đầu vào ngẫu
+nhiên từ một đường truyền có nhiễu~\cite{miller1990empirical, li2018fuzzing}. Từ xuất phát điểm
+giản dị đó, fuzzing đã phát triển thành một trong những kỹ thuật kiểm thử
+bảo mật hiệu quả và được nghiên cứu rộng rãi nhất.
+
+Giai đoạn đầu (1988--2010) chứng kiến sự phát triển của các
+\emph{blackbox fuzzer} thế hệ đầu: sinh chuỗi ngẫu nhiên hoặc dựa trên
+ngữ pháp, không có phản hồi từ chương trình. Mặc dù đơn giản, chúng phát
+hiện được nhiều lỗi thực tế trong phần mềm thương mại. Giai đoạn tiếp theo
+(2010--nay) đánh dấu bước ngoặt khi American Fuzzy Lop (AFL) của Michal
+Zalewski~\cite{zalewski2014afl} phổ biến hóa \emph{coverage-guided fuzzing}:
+sử dụng thông tin độ phủ mã thực thi như tín hiệu phản hồi để hướng dẫn
+quá trình đột biến. AFL++ \cite{fioraldi2020afl} tiếp tục mở rộng và tổng
+hợp nhiều cải tiến nghiên cứu. Song song, Google phát triển
+libFuzzer~(in-process) và honggfuzz~\cite{google2023honggfuzz} cho các
+kịch bản khác nhau.
+
+Khảo sát của Manes và cộng sự~\cite{manes2021art} phân tích hơn 200 công
+trình nghiên cứu về fuzzing và đề xuất một khung thuật ngữ thống nhất, định
+nghĩa fuzzing là \textit{``quá trình thực thi PUT (Program Under Test) với
+các đầu vào được tạo ra tự động để phát hiện lỗi và/hoặc lỗ hổng bảo mật''}.
+Zhu và cộng sự~\cite{zhu2022fuzzing} tổng hợp thêm về roadmap tương lai,
+nhấn mạnh sự cần thiết mở rộng fuzzing sang các domain phi truyền thống như
+ứng dụng web, hệ thống nhúng và giao thức mạng.
+
+\subsection{Phân loại Fuzzer theo Mức độ Thông tin}
+
+Dựa trên mức độ truy cập thông tin nội bộ của chương trình mục tiêu, fuzzer
+được phân thành ba nhóm~\cite{godefroid2007random, li2018fuzzing, zhu2022fuzzing}.
+
+\textbf{Blackbox fuzzer} hoàn toàn không có thông tin về cấu trúc bên trong
+ứng dụng. Fuzzer chỉ quan sát được đầu ra bên ngoài (HTTP response, mã trạng
+thái, thời gian phản hồi) để đánh giá test case. Ưu điểm là dễ triển khai và
+không cần mã nguồn; nhược điểm là khả năng khám phá code path rất hạn chế
+trong các ứng dụng có logic phức tạp. Nghiên cứu của Doupé và cộng
+sự~\cite{doupe2010johnny} chỉ ra rằng blackbox fuzzer bỏ sót đáng kể các lỗ
+hổng trong ứng dụng web, đặc biệt là các lỗ hổng đòi hỏi điều hướng qua
+nhiều bước tương tác.
+
+\textbf{Whitebox fuzzer} có đầy đủ thông tin về mã nguồn và cấu trúc chương
+trình, cho phép áp dụng các kỹ thuật phân tích tĩnh nặng như thực thi tượng
+trưng (symbolic execution)~\cite{godefroid2008automated} hay phân tích vết
+lan truyền dữ liệu (taint analysis)~\cite{ganesh2009taint}. Thực thi tượng
+trưng biểu diễn các biến đầu vào bằng ký hiệu toán học, xây dựng ràng buộc
+từ mỗi nhánh điều kiện, rồi dùng SMT solver để sinh giá trị cụ thể cho phép
+chương trình đi theo từng nhánh. Độ chính xác lý thuyết cao là ưu điểm,
+nhưng chi phí tính toán lớn (state explosion problem), khó xử lý các thư viện
+bên ngoài và mã nguồn động là hạn chế chính khiến kỹ thuật này khó mở rộng
+cho ứng dụng web thực tế.
+
+\textbf{Greybox fuzzer} là chiến lược trung gian, đạt được sự đánh đổi tốt
+giữa chi phí và hiệu quả: fuzzer thu thập thông tin thực thi (thường là độ
+phủ mã) trong khi chạy mà không cần phân tích tĩnh toàn bộ mã nguồn. Thông
+tin phủ này trở thành tín hiệu phản hồi để ưu tiên và đột biến các test case
+có khả năng khám phá code path mới. AFL++~\cite{fioraldi2020afl} là hiện thực
+phổ biến nhất cho ứng dụng nhị phân và là nguồn cảm hứng thiết kế của Phuzz.
+
+\subsection{Coverage-Guided Fuzzing và Vòng lặp Fuzz}
+\label{subsec:cgf-loop}
+
+Coverage-guided fuzzing (CGF) là hướng tiếp cận greybox phổ biến
+nhất~\cite{li2018fuzzing, manes2021art}. Một test case được coi là
+\emph{thú vị} nếu nó kích hoạt ít nhất một code path mới chưa từng được
+quan sát trong tập ứng viên hiện tại. Những test case như vậy được giữ lại
+trong tập ứng viên (corpus) và ưu tiên đột biến ở các vòng lặp tiếp theo.
+
+Trong fuzzing nhị phân, coverage thường được đo ở đơn vị \emph{edge}
+(cạnh trong đồ thị luồng điều khiển, tức là cặp basic block \((A, B)\) nơi
+điều khiển chuyển từ $A$ sang $B$). AFL đại diện cho tập edge đã thấy bằng
+một \emph{bitmap} $B$ gồm 65536 byte, trong đó byte $B[A \oplus B]$ đếm số
+lần edge $(A, B)$ được thực thi trong một test case. Một test case mới được
+coi là thú vị nếu bitmap của nó chứa ít nhất một edge chưa có trong bitmap
+tổng hợp từ tất cả ứng viên trước đó.
+
+Vòng lặp coverage-guided fuzzing bao gồm sáu bước chính~\cite{manes2021art}:
+\begin{enumerate}
+    \item \textbf{Khởi tạo}: Nạp tập seed ban đầu vào corpus; thực thi từng
+    seed để thiết lập coverage nền $B_0$.
+    \item \textbf{Chọn ứng viên}: Áp dụng chiến lược lên lịch seed để chọn
+    ứng viên $s$ tiếp theo từ corpus.
+    \item \textbf{Phân bổ năng lượng}: Tính số lần đột biến $E(s)$ sẽ dành
+    cho $s$ dựa theo chiến lược năng lượng.
+    \item \textbf{Đột biến}: Sinh $E(s)$ test case mới $t_1, \ldots, t_{E(s)}$
+    từ $s$ bằng các phép đột biến (bit flip, byte insertion, boundary values,\ldots).
+    \item \textbf{Thực thi và Đánh giá}: Với mỗi $t_i$: thực thi PUT, thu
+    thập bitmap $B_i$; nếu $B_i$ chứa edge mới so với bitmap tổng hợp thì
+    thêm $t_i$ vào corpus; nếu $t_i$ kích hoạt hành vi bất thường (crash, lỗi
+    bảo mật) thì ghi nhận phát hiện.
+    \item Lặp lại từ bước 2 đến khi hết ngân sách thời gian.
+\end{enumerate}
+
+Trong fuzzing nhị phân (AFL, AFL++~\cite{fioraldi2020afl, zalewski2014afl},
+honggfuzz~\cite{google2023honggfuzz}), coverage được thu thập bằng cách
+instrument các basic block tại thời điểm biên dịch (\emph{compile-time
+instrumentation}) và chia sẻ bitmap qua vùng nhớ dùng chung (shared memory)
+giữa fuzzer và tiến trình PUT.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Flowchart vòng lặp Coverage-Guided Fuzzing (6 bước, hình tròn/vòng khép kín).
+    % Bước 1 (Khởi tạo): hình chữ nhật "Seed pool ban đầu" → thực thi → coverage nền B0.
+    % Bước 2 (Chọn ứng viên): hình thoi "Corpus rỗng?" → nếu không: chọn s có score cao nhất.
+    % Bước 3 (Phân bổ năng lượng): hình chữ nhật "Tính E(s) theo power schedule".
+    % Bước 4 (Đột biến): hình chữ nhật "Sinh E(s) đột biến t1...tE".
+    % Bước 5 (Thực thi): hình chữ nhật "Gửi ti đến PUT, thu bitmap Bi".
+    % Bước 6 (Đánh giá): hình thoi "Bi có edge mới?" → có: thêm ti vào corpus (quay lại bước 2);
+    %   không: hình thoi "ti kích hoạt lỗ hổng?" → có: ghi nhận; không: tiếp tục.
+    % Mũi tên vòng lặp quay lại bước 2.
+    \includegraphics[width=0.80\textwidth]{figures/fig-cgf-loop}
+    \caption{Vòng lặp Coverage-Guided Fuzzing.}
+    \label{fig:cgf-loop}
+\end{figure}
+
+\subsection{Lên lịch Seed và Phân bổ Năng lượng}
+\label{subsec:energy-scheduling}
+
+Chiến lược lên lịch seed (\emph{seed scheduling}) và phân bổ năng lượng
+(\emph{energy assignment}) có ảnh hưởng lớn đến tốc độ khám phá code path
+mới, nhưng thường bị bỏ qua trong các thiết kế fuzzer đơn giản.
+
+\textbf{AFL gốc} dùng chiến lược round-robin đơn giản: mỗi seed được phân
+bổ số lần đột biến bằng nhau, không phân biệt tầm quan trọng. Điều này dẫn
+đến lãng phí ngân sách fuzz cho các seed ở vùng code đã được khai thác kỹ.
+
+\textbf{AFLFast}~\cite{bohme2016coverage} đưa ra khái niệm \emph{power schedule}:
+mỗi seed $s$ nhận năng lượng $E(s)$ tỷ lệ với \emph{mức độ ít được khám
+phá} của vùng code mà $s$ thực thi. Trực giác là: seed thực thi các code path
+hiếm (ít test case kích hoạt) nên nhận nhiều năng lượng hơn để fuzzer tập
+trung khai thác vùng đó. AFLFast định nghĩa nhiều power schedule khác nhau
+(FAST, COE, QUAD, LIN, EXPLOIT, EXPLORE), mỗi cái ưu tiên tiêu chí khác nhau.
+
+Trong Phuzz~\cite{neef2024phuzz}, chiến lược tương tự được áp dụng dựa trên
+số đường đi mới và dòng code mới mà mỗi ứng viên khai phá được trong quá
+khứ (xem chi tiết trong Phần~\ref{subsec:scoring}).
+
+\subsection{Thách thức khi Áp dụng lên Ứng dụng Web PHP}
+
+Khi chuyển kỹ thuật greybox fuzzing từ ứng dụng nhị phân sang ứng dụng web
+PHP, nhiều thách thức đặc thù xuất hiện~\cite{neef2024phuzz,
+vanrooij2021webfuzz}.
+
+\textbf{Thách thức về instrumentation.} PHP là ngôn ngữ thông dịch,
+không biên dịch trước, nên không thể instrument ở tầng nhị phân như AFL.
+Giữa fuzzer và ứng dụng PHP luôn có web server trung gian (Apache, nginx)
+tạo lớp gián tiếp. Cơ chế shared memory của AFL không áp dụng được vì các
+thành phần chạy trên các container riêng biệt. Phuzz giải quyết bằng cách
+dùng PHP extension (Xdebug/PCOV) ghi coverage ra file tmpfs, và fuzzer đọc
+lại file sau mỗi request.
+
+\textbf{Thách thức về phát hiện lỗ hổng.} Trong fuzzing nhị phân, crash
+của ứng dụng là chỉ số rõ ràng cho hành vi bất thường. Với PHP, interpreter
+không crash --- thay vào đó emit exception hoặc error message, và web server
+trả về trang lỗi với mã HTTP 5xx. Hơn nữa, ứng dụng có thể bắt và xử lý
+lỗi một cách graceful (try/catch), che giấu hoàn toàn tín hiệu. Đặc biệt,
+các lớp lỗ hổng như Blind SSRF không để lại bất kỳ dấu vết nào trong HTTP
+response --- thách thức này là trọng tâm của khóa luận.
+
+\textbf{Thách thức về sinh test case.} HTTP request có cấu trúc nghiêm ngặt
+(method, headers, body encoding); đột biến tùy tiện ở mức byte tạo ra request
+không hợp lệ bị web server từ chối trước khi đến PHP. Fuzzer phải thực hiện
+đột biến có kiểm soát --- chỉ thay đổi các tham số cụ thể (query string,
+POST body, cookie, header) mà không phá vỡ cấu trúc HTTP.
+
+\textbf{Thách thức về trạng thái ứng dụng.} Ứng dụng web thường có trạng
+thái phức tạp: session cookie hết hạn, CSRF token thay đổi theo từng request,
+database bị ô nhiễm sau các thao tác ghi. Fuzzer cần cơ chế đăng nhập lại tự
+động, quản lý session và trong nhiều trường hợp cần reset cơ sở dữ liệu về
+trạng thái sạch giữa các lần fuzz để đảm bảo tính tái hiện.
+
+\textbf{Thách thức về môi trường đa tiến trình.} PHP web applications thường
+dùng cơ sở dữ liệu, cache và hàng đợi bất đồng bộ. Khi nhiều instance fuzzer
+chạy song song, các request có thể can thiệp lẫn nhau qua trạng thái chia
+sẻ trong database, dẫn đến hành vi không tái hiện được.
+
+% ============================================================
+\section{Framework Phuzz}
+\label{sec:phuzz}
+% ============================================================
+
+Phuzz~\cite{neef2024phuzz} là framework coverage-guided fuzzing modular,
+được thiết kế đặc thù cho ứng dụng web PHP. Được trình bày tại hội nghị
+AsiaCCS 2024, Phuzz giải quyết các thách thức nêu trong
+Phần~\ref{sec:greybox-fuzzing} thông qua kiến trúc container hóa và cơ chế
+instrumentation trong suốt. Đây là nền tảng mà khóa luận này mở rộng để
+thêm khả năng phát hiện SSRF.
+
+\subsection{Kiến trúc Tổng thể}
+
+Toàn bộ Phuzz được triển khai trong môi trường Docker~\cite{docker2023}, cho
+phép khởi chạy và tái tạo môi trường fuzz một cách nhất quán trên mọi máy.
+Hệ thống bao gồm các thành phần chính:
+
+\textbf{Browser và Crawler.} Quá trình bắt đầu bằng việc thu thập các
+endpoint cần fuzz. Phuzz hỗ trợ hai phương thức: (1) tự động crawl bằng
+headless Chromium qua thư viện Playwright~\cite{microsoft2024playwright},
+ghi lại tất cả HTTP request như một HAR file; (2) thủ công bằng cách xuất
+HAR file từ DevTools của trình duyệt sau khi tương tác với ứng dụng. Phương
+thức thủ công cho phép kiểm soát chính xác phạm vi fuzz, đặc biệt hữu ích
+với các API endpoint yêu cầu xác thực phức tạp hoặc multi-step workflow.
+
+\textbf{HARgen và Composegen.} HARgen chuyển đổi HAR file thành file cấu
+hình fuzzer ở định dạng JSON. Mỗi tham số (query, body, cookie, header) được
+đánh dấu \texttt{fixed} (giữ nguyên, dùng cho session token) hoặc
+\texttt{fuzz} (sẽ bị đột biến). Composegen sinh file
+\texttt{docker-compose.yml} từ tập cấu hình, cho phép khởi chạy toàn bộ
+môi trường chỉ bằng một lệnh. Định dạng cấu hình JSON điển hình:
+
+\begin{verbatim}
+{
+  "target": "http://web/wp-admin/admin-ajax.php",
+  "methods": ["POST"],
+  "cookies": {
+    "data":  [{"name": "wordpress_logged_in_...",
+               "seeds": ["<session>"]}],
+    "fixed": [".*"],
+    "login": ["wordpress_logged_in_.*"]
+  },
+  "body_params": {
+    "data":   [{"name": "url", "seeds": ["http://example.com"]}],
+    "fuzz":   ["url"],
+    "weight": 1.0
+  }
+}
+\end{verbatim}
+
+\textbf{Fuzzer.} Thành phần trung tâm, thực hiện vòng lặp fuzz (chi tiết tại
+Phần~\ref{subsec:cgf-loop}): đọc cấu hình endpoint, khởi tạo tập ứng viên
+ban đầu, chọn ứng viên điểm cao nhất, tính năng lượng, sinh đột biến, gửi
+request có header \texttt{X-Fuzzer-Covid: <ID>}, đọc coverage, chạy
+VulnChecker và cập nhật điểm ứng viên. Nhiều instance fuzzer có thể chạy
+song song, đồng bộ hóa tập ứng viên đã đánh giá qua shared volume để tránh
+thực thi trùng lặp.
+
+\textbf{Shared Volume (tmpfs).} Phuzz dùng Docker tmpfs volume làm kênh trao
+đổi thông tin giữa các container. PHP-side instrumentation ghi coverage report
+vào \texttt{/shared-tmpfs/coverage-reports/<ID>.json}; fuzzer đọc lại để đánh
+giá ứng viên. Cơ chế này giải quyết vấn đề thiếu shared memory xuyên container.
+Ngoài coverage, tmpfs còn lưu các loại báo cáo khác: hook trigger, OOB log và
+kết quả phát hiện lỗ hổng.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Sơ đồ kiến trúc Phuzz với luồng dữ liệu.
+    % Phần trên: Kiểm thử viên → Playwright Browser → HAR file
+    %            → HARgen → fuzzer-config.json → Composegen → docker-compose.yml.
+    % Docker environment (hình chữ nhật bao quanh 3 container):
+    %   - phuzz-fuzzer: "Fuzzer (Python)" — vòng lặp fuzz, VulnChecker, Candidate Pool.
+    %   - phuzz-web: "Web Container (PHP 8 + Apache + PCOV)" — ứng dụng mục tiêu,
+    %                 auto_prepend_file instrumentation.
+    %   - phuzz-db: "Database (MySQL 8)".
+    % Mũi tên giữa các container:
+    %   fuzzer → [HTTP request + X-Fuzzer-Covid header] → web.
+    %   web → [coverage JSON] → shared-tmpfs/coverage-reports/.
+    %   fuzzer ← [đọc coverage] ← shared-tmpfs.
+    %   web ↔ db (SQL queries).
+    % Phần dưới: shared-tmpfs (hình trụ) kết nối fuzzer ↔ web.
+    \includegraphics[width=0.88\textwidth]{figures/fig-phuzz-arch}
+    \caption{Kiến trúc hệ thống Phuzz.}
+    \label{fig:phuzz-arch}
+\end{figure}
+
+\subsection{Cơ chế Instrumentation}
+\label{subsec:instrumentation}
+
+\textbf{Thu thập coverage.} Phuzz hỗ trợ hai PHP extension:
+Xdebug~\cite{rethans2002xdebug} và PCOV~\cite{watkins2023pcov}. Điểm then
+chốt là instrumentation hoàn toàn \emph{trong suốt} với ứng dụng mục tiêu
+--- không cần chỉnh sửa mã nguồn PHP, cấu hình web server, hay cơ sở dữ
+liệu. Phuzz dùng \texttt{auto\_prepend\_file} (cấu hình PHP) để inject
+instrumentation code trước khi PHP chạy bất kỳ code ứng dụng nào; và đăng
+ký \texttt{register\_shutdown\_function} để đảm bảo coverage luôn được lưu
+kể cả khi ứng dụng gọi \texttt{exit()} hoặc bị terminate bởi bộ giới hạn
+thời gian.
+
+Mỗi request mang header bổ sung \texttt{X-Fuzzer-Covid: <ID>} (định danh
+dạng \texttt{<timestamp>-<UUIDv4>}). PHP-side code đọc header qua
+\texttt{\$\_SERVER['HTTP\_X\_FUZZER\_COVID']}, bật coverage collection ngay
+đầu request, và lưu report ra \texttt{/shared-tmpfs/coverage-reports/<ID>.json}
+khi shutdown. File JSON chứa danh sách file PHP và line number đã được thực thi,
+cùng thông tin về lời gọi hàm mà các hook đã ghi lại.
+
+\textbf{So sánh Xdebug và PCOV.}
+
+\begin{itemize}
+    \item \textbf{Xdebug}~\cite{rethans2002xdebug}: Extension đa năng (debug,
+    profile, trace, coverage); hỗ trợ branch coverage và path coverage theo
+    dõi từng nhánh điều kiện. Overhead lớn hơn PCOV nhưng thông tin phong
+    phú hơn.
+    \item \textbf{PCOV}~\cite{watkins2023pcov}: Extension chuyên dụng cho
+    line coverage; overhead thấp hơn đáng kể. Đây là lựa chọn mặc định của
+    Phuzz để tối ưu throughput.
+\end{itemize}
+
+\textbf{Function hooking với UOPZ.} UOPZ (User Operations for
+Zend)~\cite{phpgroup2023uopz} là PHP extension cho phép thao tác hàm ở tầng
+interpreter. Phuzz dùng UOPZ để bọc (wrap) các hàm PHP nguy hiểm nhằm bắt
+lời gọi hàm, ghi lại đối số và exception:
+
+\begin{verbatim}
+uopz_set_return('mysqli_query', function($conn, $query) {
+    $result = mysqli_query($conn, $query);
+    if ($result === false) {
+        $err = mysqli_error($conn);
+        phuzz_log_error('sqli', ['query' => $query,
+                                 'error' => $err]);
+    }
+    return $result;
+}, true);
+\end{verbatim}
+
+Nhờ đó Phuzz có thể bắt lời gọi hàm cùng đối số để xác nhận input từ
+attacker đã lan truyền tới điểm nguy hiểm; bắt exception/error do input
+không hợp lệ gây ra; và vô hiệu hóa các cơ chế xác thực/phân quyền để
+fuzz các code path thông thường không thể tiếp cận.
+
+\subsection{Công thức Đánh giá Ứng viên}
+\label{subsec:scoring}
+
+Mỗi ứng viên $c$ trong corpus được gán điểm số để quyết định thứ tự ưu tiên.
+Phuzz dùng \texttt{DefaultScoringFormula}, kết hợp hai thành phần:
+
+\begin{itemize}
+    \item \textbf{$\Delta\text{paths}$}: Số code path (cặp dòng code liên tiếp
+    trong luồng thực thi) mà $c$ khám phá \emph{lần đầu tiên} so với toàn bộ
+    corpus hiện tại. Đây là thước đo chính về mức độ ``thú vị'' của $c$.
+    \item \textbf{$\Delta\text{lines}$}: Số dòng code mới mà $c$ khám phá, bổ
+    trợ cho $\Delta\text{paths}$ trong trường hợp ứng viên cover nhiều dòng
+    mới nhưng ít path mới.
+\end{itemize}
+
+Điểm tổng hợp được tính theo:
+\[
+    \text{score}(c) = \alpha \cdot \Delta\text{paths}(c)
+                    + \beta  \cdot \Delta\text{lines}(c)
+\]
+với $\alpha$ và $\beta$ là trọng số cấu hình. Ứng viên có điểm cao nhất được
+chọn ở bước 2 của vòng lặp fuzz; khi hai ứng viên bằng điểm, ứng viên mới
+hơn được ưu tiên. Năng lượng $E(c)$ --- số lần đột biến --- tỷ lệ tuyến tính
+với $\text{score}(c)$, đảm bảo các ứng viên ``thú vị'' nhận được nhiều đột
+biến hơn.
+
+\subsection{Phát hiện Lỗ hổng}
+\label{subsec:phuzz-vulncheckers}
+
+\textbf{Lỗ hổng phía server.} Phuzz hook các hàm PHP native; khi input từ
+fuzzer gây ra lỗi, thông tin debug (tên hàm, đối số, thông báo lỗi) được lưu
+trong coverage report và chuyển tới VulnChecker:
+
+\begin{itemize}
+    \item \textbf{SQL Injection (SQLi)}: Hook bốn hàm MySQL
+    (\texttt{mysqli\_query}, \texttt{mysqli::query}, \texttt{PDO::query},
+    \texttt{PDO::exec}); input không hợp lệ tạo ra SQL syntax error được ghi
+    nhận trong error log.
+    \item \textbf{Command Injection (RCE)}: Hook bốn hàm shell
+    (\texttt{shell\_exec}, \texttt{system}, \texttt{passthru}, \texttt{exec});
+    kiểm tra thông báo lỗi về lệnh không hợp lệ, hoặc return code khác 0.
+    \item \textbf{Path Traversal (PaTr)}: Hook 48 hàm file-related
+    (\texttt{file\_get\_contents}, \texttt{fopen}, \texttt{file\_exists},
+    v.v.); phát hiện khi path nguy hiểm như \texttt{/etc/passwd} được truyền
+    vào hàm file.
+    \item \textbf{Insecure Deserialization (IDes)}: Hook \texttt{unserialize()};
+    input không hợp lệ tạo ra lỗi PHP object injection.
+    \item \textbf{XML External Entity (XXE)}: Hook \texttt{DOMDocument::loadXML}
+    trong cấu hình \texttt{LIBXML\_NOENT} cho phép external entity expansion.
+\end{itemize}
+
+\textbf{Lỗ hổng phía client.} Hai lớp lỗ hổng client-side được phát hiện
+bằng phân tích HTTP response, không cần instrumentation phía server:
+Cross-Site Scripting (XSS) theo thuật toán webFuzz~\cite{vanrooij2021webfuzz}
+--- chèn marker vào payload và kiểm tra sự xuất hiện của nó trong DOM
+response; và Open Redirection (OpRe) --- kiểm tra mã 3xx và giá trị header
+\texttt{Location} xem liệu input có xuất hiện trong URL chuyển hướng.
+
+\textbf{ParamBasedVulnChecker.} Để giảm false positive, Phuzz triển khai
+\texttt{ParamBasedVulnChecker}: chỉ phát cảnh báo khi ít nhất một tham số
+fuzz xuất hiện trong đối số truyền vào hàm bị hook, đảm bảo input từ fuzzer
+đã thực sự propagate tới điểm nguy hiểm (sink). Điều này loại bỏ các cảnh
+báo giả khi ứng dụng tự tạo ra lỗi SQL không liên quan đến input của fuzzer.
+
+\subsection{Sinh Test Case và Đột biến Tham số}
+
+Phuzz yêu cầu seed ban đầu qua file cấu hình JSON. Ứng viên được chấm điểm
+theo số đường đi mới và dòng code mới phía server. Đột biến diễn ra ở mức
+byte trên các chuỗi tham số --- không phải toàn bộ HTTP request --- đảm bảo
+request luôn hợp lệ. Phuzz định nghĩa kiến trúc \texttt{ParamMutator} plugin:
+
+\begin{itemize}
+    \item \textbf{Các mutator byte-level cơ bản}: BitFlipMutator (đảo bit),
+    ByteFlipMutator, ArithmeticMutator (tăng/giảm byte value), SpliceMutator
+    (ghép hai tham số), DeleteMutator, RepeatMutator, \ldots
+    \item \textbf{Mutator ngữ nghĩa đặc thù lỗ hổng}: ProtocolPrefixMutator
+    (prefix \texttt{http://}), PathTraversalPayloadParamMutator (chèn
+    \texttt{../}), XSSPayloadParamMutator (chèn XSS marker).
+    \item \textbf{SSRFMutator} (đề xuất của khóa luận này): chèn 21 biến thể
+    URL OOB với các kỹ thuật bypass khác nhau (chi tiết Chương~3).
+\end{itemize}
+
+\subsection{Giới hạn của Phuzz và Khoảng trống Nghiên cứu}
+
+Mặc dù đạt hiệu quả cao trong phát hiện các lỗ hổng truyền thống --- 99\%
+trong bộ benchmark 87 lỗ hổng đã biết --- bài báo gốc~\cite{neef2024phuzz}
+thừa nhận rõ ràng hai giới hạn liên quan trực tiếp đến khóa luận này.
+
+Thứ nhất, Phuzz bỏ sót SSRF trong quá trình fuzzing tự động. Cụ thể,
+CVE-2023-6294 (SSRF trong plugin popup-builder cho WordPress) chỉ được phát
+hiện thủ công trong bước review sau khi Phuzz tìm thấy lỗ hổng đọc file tùy
+ý. Bài báo ghi nhận thẳng thắn: \textit{``The SSRF could have been found by
+Phuzz, if \texttt{wp\_remote\_get} was hooked and included in the vulnerability
+detection.''} Thứ hai, Phuzz không có kênh phản hồi nào cho các lỗ hổng mà
+ứng dụng âm thầm thực hiện hành vi mạng mà không để lại dấu vết trong HTTP
+response hay exception. Bài báo liệt kê SSRF là ưu tiên hàng đầu trong phần
+Future Work.
+
+Đây chính là khoảng trống mà khóa luận này lấp đầy.
+
+% ============================================================
+\section{Phân tích Động và Hook Hàm trong PHP}
+\label{sec:hooking}
+% ============================================================
+
+\subsection{Kiến trúc Runtime của PHP}
+\label{subsec:zend-engine}
+
+PHP được thực thi qua Zend Engine, một trình thông dịch viết bằng C. Hiểu
+kiến trúc này là cơ sở để thiết kế cơ chế hooking hiệu quả~\cite{phpgroup2023history}.
+
+Luồng thực thi PHP bao gồm bốn giai đoạn:
+\begin{enumerate}
+    \item \textbf{Lexing và Parsing}: Mã nguồn PHP được tokenize và parse
+    thành Abstract Syntax Tree (AST).
+    \item \textbf{Compilation}: AST được biên dịch thành \emph{opcodes}
+    (Zend VM bytecode). Opcache có thể cache opcodes để tăng tốc.
+    \item \textbf{Execution}: Zend VM thực thi opcode. Mỗi lời gọi hàm tra
+    cứu trong \emph{function table} (bảng hash mapping tên hàm thành
+    \texttt{zend\_function} struct).
+    \item \textbf{Shutdown}: Gọi shutdown functions, giải phóng bộ nhớ.
+\end{enumerate}
+
+Điểm quan trọng là \emph{function table} có thể được thao tác ở runtime bởi
+các extension, cho phép thay thế hoặc bọc bất kỳ hàm PHP built-in nào. Đây
+là cơ chế mà UOPZ khai thác.
+
+\textbf{Cơ chế auto\_prepend\_file.} PHP cung cấp directive
+\texttt{auto\_prepend\_file} trong \texttt{php.ini}: một file PHP được include
+tự động trước khi thực thi bất kỳ script PHP nào. Phuzz dùng cơ chế này để
+inject instrumentation code (coverage collection và function hooks) một cách
+trong suốt --- ứng dụng mục tiêu không biết về sự tồn tại của code bổ sung
+này.
+
+\subsection{Extension UOPZ --- Cơ chế và API}
+\label{subsec:uopz}
+
+UOPZ (User Operations for Zend Engine)~\cite{phpgroup2023uopz} là PHP extension
+cho phép thao tác với hàm và lớp PHP tại tầng Zend Engine ở runtime, không
+cần sửa mã nguồn. Ba API chính phục vụ các mục đích khác nhau:
+
+\begin{itemize}
+    \item \textbf{uopz\_set\_hook(\$function, \$hook)}: Đặt hook được gọi
+    \emph{trước} hàm gốc, với cùng tham số. Dùng để capture đối số trước khi
+    hàm thực thi; hàm gốc vẫn chạy bình thường sau đó. Đây là API dùng trong
+    khóa luận này để hook các hàm mạng SSRF.
+    \item \textbf{uopz\_set\_return(\$function, \$value, \$execute = false)}:
+    Thay thế return value của hàm. Khi \texttt{\$execute = true}, wrap hàm
+    bằng closure và gọi hàm gốc bên trong. Phuzz dùng API này để bắt exception.
+    \item \textbf{uopz\_redefine(\$constant, \$value)}: Redefine hằng số tại
+    runtime.
+    \item \textbf{uopz\_undefine(\$function)}: Vô hiệu hóa hoàn toàn một hàm.
+    Phuzz dùng để disable các hàm xác thực/phân quyền.
+\end{itemize}
+
+Ví dụ về \texttt{uopz\_set\_hook} để ghi nhận lời gọi \texttt{file\_get\_contents}:
+
+\begin{verbatim}
+uopz_set_hook('file_get_contents', function($filename) {
+    // Chạy trước file_get_contents() thực sự
+    if (filter_var($filename, FILTER_VALIDATE_URL)) {
+        phuzz_log_ssrf_hook([
+            'func'     => 'file_get_contents',
+            'url'      => $filename,
+            'covID'    => $_SERVER['HTTP_X_FUZZER_COVID'] ?? '',
+        ]);
+    }
+});
+\end{verbatim}
+
+Ưu điểm quan trọng nhất của UOPZ là hook hoạt động \emph{ở tầng interpreter},
+nghĩa là áp dụng cho mọi lời gọi từ bất kỳ tầng abstraction nào: dù ứng dụng
+gọi hàm trực tiếp, qua framework, hay qua nhiều lớp wrapper, hook vẫn được
+kích hoạt.
+
+\textbf{So sánh với các cơ chế hooking khác.}
+\begin{itemize}
+    \item \textbf{Xdebug trace}: Ghi lại mọi lời gọi hàm theo kiểu trace,
+    nhưng không cho phép can thiệp vào luồng thực thi hay sửa đổi đối số.
+    Overhead rất lớn.
+    \item \textbf{APM agents (Datadog, New Relic)}: Dùng cơ chế tương tự để
+    instrument function calls, nhưng được thiết kế cho performance monitoring,
+    không phải security testing.
+    \item \textbf{Monkey patching (override trong PHP user-space)}: Không thể
+    override PHP built-in functions bằng cách đơn giản như trong Python ---
+    UOPZ là cần thiết cho mục đích này.
+\end{itemize}
+
+\subsection{Phân loại Hàm PHP Có Nguy cơ SSRF}
+
+Trong PHP, SSRF không chỉ phát sinh từ một hàm duy nhất mà từ nhiều nhóm
+hàm khác nhau, mỗi nhóm có đặc điểm riêng về cách thực hiện kết nối
+mạng. Hiểu rõ các nhóm này là cơ sở để thiết kế cơ chế hook toàn diện.
+
+\textbf{Nhóm Network/HTTP.} Các hàm như \texttt{file\_get\_contents},
+\texttt{fopen}, \texttt{readfile}, \texttt{file} là các hàm đa năng trong
+PHP --- khi nhận một URL thay cho đường dẫn file cục bộ, chúng âm thầm thực
+hiện HTTP/FTP request thông qua stream wrapper. Đây là nhóm phổ biến nhất vì
+lập trình viên thường dùng chúng để đọc dữ liệu từ remote API mà không nhận
+ra nguy cơ. Các hàm \texttt{get\_headers}, \texttt{get\_meta\_tags},
+\texttt{getimagesize} cũng thực hiện HTTP request ngầm khi nhận URL.
+
+\textbf{Nhóm cURL.} Thư viện cURL (\texttt{curl\_exec},
+\texttt{curl\_multi\_exec}) cung cấp một client HTTP đầy đủ tính năng. Điểm
+đặc biệt về kỹ thuật: URL được thiết lập qua \texttt{curl\_setopt} ở bước
+cấu hình (\texttt{CURLOPT\_URL}), không phải qua \texttt{curl\_exec} ở bước
+thực thi --- do đó cần hook cả hai để không bỏ sót URL được set từ trước.
+
+\textbf{Nhóm Sockets.} \texttt{fsockopen}, \texttt{pfsockopen} và
+\texttt{stream\_socket\_client} mở kết nối TCP/UDP thô trực tiếp tới
+hostname:port tùy ý, bỏ qua mọi lớp HTTP abstraction. Đây thường là điểm
+sink trong các thư viện HTTP bậc thấp và protocol client (SMTP, Redis, \ldots).
+
+\textbf{Nhóm Shell execution.} Ngoài SSRF thuần túy, một kịch bản nguy hiểm
+khác là Command Injection dẫn tới SSRF: input của người dùng được truyền vào
+các hàm thực thi shell (\texttt{shell\_exec}, \texttt{system}, \texttt{exec},
+\texttt{passthru}, \texttt{popen}) và chứa lệnh như \texttt{curl} hay
+\texttt{wget} trỏ tới địa chỉ tùy ý. Việc hook nhóm này cho phép phát hiện
+đồng thời cả hai lớp lỗ hổng: Command Injection và SSRF qua command.
+
+\textbf{Nhóm CMS wrappers.} Các framework như WordPress cung cấp các hàm
+HTTP wrapper cấp cao (\texttt{wp\_remote\_get}, \texttt{wp\_remote\_post},
+\texttt{wp\_remote\_request}, \texttt{wp\_remote\_head}, \texttt{wp\_safe\_remote\_get},
+\texttt{wp\_safe\_remote\_post}) nằm trên cùng của thư viện WP HTTP. Nhiều
+plugin WordPress dùng các hàm này thay cho cURL hay \texttt{file\_get\_contents}
+trực tiếp; nếu chỉ hook tầng thấp sẽ bỏ sót các lời gọi thông qua wrapper.
+
+\textbf{Nhóm Stream wrappers.} PHP hỗ trợ \texttt{stream\_socket\_client},
+\texttt{stream\_context\_create} cùng với \texttt{fopen} để tạo kết nối mạng
+bậc thấp. Điểm đặc biệt là stream wrapper có thể được đăng ký tùy chỉnh bởi
+các extension (ví dụ: \texttt{s3://} cho Amazon S3), tạo ra các sink SSRF
+không có trong danh sách hook mặc định.
+
+Một thiết kế hook SSRF hoàn chỉnh cần bao phủ cả năm nhóm trên. Chi tiết
+cài đặt cụ thể được trình bày trong Chương~3.
+
+\subsection{Kiến trúc Hai Tầng Tín hiệu cho SSRF}
+\label{subsec:two-layer}
+
+Giải pháp đề xuất trong khóa luận này kết hợp hai tầng tín hiệu bổ sung cho
+nhau, giải quyết các giới hạn của từng tầng đơn lẻ:
+
+\textbf{Tầng 1 --- PHP Hook (In-band, đồng bộ).} Hook các hàm mạng PHP bằng
+UOPZ để ghi nhận lời gọi hàm ngay trong request handler. Khi hàm mạng được
+gọi với một URL, hook ghi thông tin (tên hàm, URL đích, coverage ID) vào
+\texttt{/shared-tmpfs/ssrf-hooks/<covID>.json}. Tín hiệu nhanh và trực tiếp,
+cung cấp ngữ cảnh phong phú (hàm nào, URL nào), nhưng chỉ kích hoạt khi
+ứng dụng thực sự gọi hàm mạng với input của fuzzer và hook được kích hoạt
+trong cùng request handler.
+
+\textbf{Tầng 2 --- OOB Callback (Out-of-band, bất đồng bộ).} Lắng nghe kết
+nối từ ứng dụng mục tiêu trên OOB server. Khi ứng dụng thực hiện HTTP request
+tới URL OOB (\texttt{http://oob-server/<token>}), OOB server ghi log vào
+\texttt{/shared-tmpfs/oob-logs/<token>.json}. Đây là bằng chứng mạng không
+thể phủ nhận: nếu OOB server nhận kết nối mang token của fuzzer, ứng dụng đã
+thực sự thực hiện network request tới địa chỉ ngoài. Tín hiệu này đặc biệt
+quan trọng cho Blind SSRF với xử lý bất đồng bộ.
+
+Hai tầng này được kết hợp trong \texttt{SSRFVulnCheck} theo logic \textsc{AND}:
+một ứng viên chỉ được báo cáo là SSRF khi có \emph{cả hai} tín hiệu cùng
+hiện diện --- hook ghi nhận lời gọi hàm mạng, \emph{và} OOB server nhận được
+callback. Điều này đảm bảo:
+\begin{itemize}
+    \item Tầng 1 cung cấp phát hiện nhanh và ngữ cảnh (URL đích, hàm được
+    gọi, line số trong PHP).
+    \item Tầng 2 là xác nhận cuối cùng không thể tranh cãi: bằng chứng mạng
+    thực tế.
+    \item Logic AND loại bỏ false positive từ cả hai phía: hook có thể bị
+    kích hoạt bởi request hợp lệ, nhưng OOB callback chỉ xảy ra khi ứng dụng
+    thực sự kết nối đến OOB server với đúng token.
+\end{itemize}
+
+% ============================================================
+\section{Nhận xét về Bài toán cần Giải quyết}
+\label{sec:problem-statement}
+% ============================================================
+
+Dựa trên các kiến thức nền tảng được xây dựng trong chương này, có thể
+phát biểu bài toán nghiên cứu một cách chính xác và đầy đủ.
+
+\subsection{Tổng hợp Khoảng trống Kỹ thuật}
+
+Greybox fuzzing với coverage guidance (Phần~\ref{sec:greybox-fuzzing}) là
+phương pháp phù hợp nhất để kiểm thử bảo mật ứng dụng web PHP tự động:
+nó không yêu cầu mã nguồn, mở rộng tốt, và có thể tích hợp tín hiệu phản
+hồi phong phú. Phuzz~\cite{neef2024phuzz} (Phần~\ref{sec:phuzz}) là hiện
+thực hóa tốt nhất của hướng tiếp cận này, đạt 99\% phát hiện trên bộ
+benchmark 87 lỗ hổng truyền thống.
+
+Tuy nhiên, kiến trúc hiện tại của Phuzz --- và của mọi greybox fuzzer web
+hiện tại --- dựa trên giả định cơ bản rằng tín hiệu phản hồi đến từ hai
+kênh: HTTP response và code coverage. Cả hai kênh đều không thể quan sát
+hành vi mạng ẩn của ứng dụng. Bảng~\ref{tab:signal-gap} tổng hợp khoảng
+trống này:
+
+\begin{table}[h]
+\centering
+\caption{Tín hiệu phản hồi sẵn có và khả năng phát hiện từng loại lỗ hổng}
+\label{tab:signal-gap}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Tín hiệu phản hồi} & \textbf{SQLi} & \textbf{XSS} & \textbf{SSRF} & \textbf{Blind SSRF} \\
+\hline
+Nội dung HTTP response      & \checkmark & \checkmark & \checkmark & \ding{55} \\
+HTTP status code bất thường & \checkmark & \ding{55}  & Có thể     & \ding{55} \\
+Exception / thông báo lỗi   & \checkmark & \ding{55}  & Có thể     & \ding{55} \\
+Độ phủ mã (code coverage)   & \checkmark & \checkmark & \checkmark & \ding{55} \\
+\textbf{OOB network callback}& \ding{55}  & \ding{55}  & \checkmark & \checkmark \\
+\hline
+\end{tabular}
+\end{table}
+
+Cơ chế hook hàm PHP qua UOPZ (Phần~\ref{sec:hooking}) cung cấp khả năng
+bắt lời gọi hàm mạng ở tầng interpreter --- nhưng bản thân hook chỉ là
+tín hiệu in-band, không thể xác nhận ứng dụng đã \emph{thực sự} thực hiện
+kết nối ra ngoài.
+
+\subsection{Phát biểu Bài toán}
+
+Bài toán nghiên cứu của khóa luận này là:
+
+\begin{quote}
+\textit{Thiết kế và cài đặt một hệ thống phát hiện Blind SSRF hoàn toàn
+tự động, tích hợp vào vòng lặp greybox fuzzing PHP của Phuzz, sao cho:
+(1)~mọi tham số HTTP có thể là SSRF sink đều được kiểm thử với payload
+bao phủ các kỹ thuật bypass phổ biến; (2)~bằng chứng lỗ hổng được xác
+nhận qua hai kênh tín hiệu độc lập (in-band hook và out-of-band callback)
+theo logic AND, đảm bảo zero false positive; và (3)~toàn bộ quá trình từ
+sinh payload đến xác nhận lỗ hổng diễn ra tự động mà không cần can thiệp
+thủ công.}
+\end{quote}
+
+\subsection{Yêu cầu Kỹ thuật}
+
+Bài toán đặt ra ba yêu cầu kỹ thuật cụ thể cần giải quyết:
+
+\begin{enumerate}
+    \item \textbf{Kênh tín hiệu thứ ba (OOB).} Cần một máy chủ lắng nghe
+    độc lập có thể nhận kết nối từ ứng dụng mục tiêu và tương quan chính
+    xác mỗi callback với ứng viên fuzz đã kích hoạt nó --- ngay cả trong
+    môi trường song song với hàng nghìn request đồng thời.
+    \item \textbf{Bộ đột biến chuyên biệt.} Cần payload SSRF bao phủ đầy
+    đủ các kỹ thuật bypass (mã hóa IP, DNS redirect, userinfo trick, \ldots)
+    để không bỏ sót các lỗ hổng chỉ phát hiện được qua một biến thể cụ thể.
+    \item \textbf{Tích hợp không xâm lấn.} Giải pháp phải tương thích với
+    kiến trúc plugin của Phuzz, không phá vỡ các chức năng phát hiện lỗ
+    hổng gốc, và có thể triển khai trên bất kỳ ứng dụng PHP mục tiêu nào
+    mà không cần sửa đổi mã nguồn ứng dụng.
+\end{enumerate}
+
+Chương~3 trình bày giải pháp đáp ứng đầy đủ cả ba yêu cầu trên.
+
+\section{Tổng kết Chương}
+
+Chương này đã xây dựng nền tảng lý thuyết cho toàn bộ khóa luận qua ba
+mảng kiến thức liên kết chặt chẽ.
+
+Greybox fuzzing với coverage guidance là chiến lược hiệu quả để khám phá
+lỗ hổng trong ứng dụng web PHP, nhưng yêu cầu giải quyết các thách thức
+đặc thù: instrumentation qua HTTP, quản lý trạng thái ứng dụng và phát hiện
+lỗ hổng không có crash signal. Phuzz là framework hiện thực hóa chiến lược
+đó, đạt hiệu quả cao trên nhiều lớp lỗ hổng truyền thống và được thiết kế
+modular để mở rộng. Tuy nhiên, kiến trúc hiện tại của Phuzz không có khả
+năng phát hiện Blind SSRF vì cả hai kênh phản hồi truyền thống (HTTP response
+và coverage) đều không quan sát được hành vi mạng ẩn của ứng dụng.
+
+Cơ chế hook hàm mạng PHP qua UOPZ cung cấp tín hiệu in-band tức thì khi
+hàm mạng được gọi. Tuy nhiên hook đơn lẻ chưa đủ --- cần một kênh tín hiệu
+ngoài băng (OOB) độc lập để xác nhận ứng dụng đã thực sự kết nối ra ngoài.
+
+Hai tầng tín hiệu (PHP hook AND OOB callback) cùng tạo thành nền tảng kỹ
+thuật cho thiết kế và cài đặt được trình bày trong Chương~3, nơi lỗ hổng
+SSRF và kỹ thuật OOB được phân tích chi tiết trước khi trình bày cài đặt
+hệ thống.

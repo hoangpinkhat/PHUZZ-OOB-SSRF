@@ -264,6 +264,13 @@ class SingleMutator(Mutator):
             SuperRandomMutator()
         ]
 
+        # Inject SSRFMutator if available (lazy import avoids circular deps)
+        try:
+            from ssrf_mutator import SSRFMutator
+            self.param_mutators.append(SSRFMutator())
+        except ImportError:
+            pass
+
         self.iterator = self.mutation_iterator()
 
     def mutation_iterator(self):
@@ -281,6 +288,43 @@ class SingleMutator(Mutator):
                 self.iterator = self.mutation_iterator()
                 continue
         return new_str
+
+class SSRFOnlyMutator(Mutator):
+    """Mutator that exclusively generates SSRF OOB payloads.
+    Use with config flag "ssrf_only": true to ensure every mutation
+    sends an SSRF probe instead of ~1/13 probability."""
+
+    def __init__(self):
+        super(Mutator, self).__init__()
+        from ssrf_mutator import SSRFMutator
+        self.param_mutators = [SSRFMutator()]
+        self.iterator = self.mutation_iterator()
+
+    def mutation_iterator(self):
+        while True:
+            yield self.param_mutators[0]
+
+    def mutate(self, string):
+        return next(self.iterator).mutate(string)
+
+
+class CmdInjSSRFOnlyMutator(Mutator):
+    """Mutator that exclusively generates command-injection SSRF payloads.
+    Use with config flag "ssrf_only": true on command-injection endpoints."""
+
+    def __init__(self):
+        super(Mutator, self).__init__()
+        from ssrf_mutator import CmdInjectionSSRFMutator
+        self.param_mutators = [CmdInjectionSSRFMutator()]
+        self.iterator = self.mutation_iterator()
+
+    def mutation_iterator(self):
+        while True:
+            yield self.param_mutators[0]
+
+    def mutate(self, string):
+        return next(self.iterator).mutate(string)
+
 
 class EmptyQueueMutator(Mutator):
     def __init__(self):

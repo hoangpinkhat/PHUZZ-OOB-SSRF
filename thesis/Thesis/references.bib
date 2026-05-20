@@ -1,0 +1,245 @@
+% ============================================================
+%  Tài liệu tham khảo -- Khóa luận tốt nghiệp
+%  Trần Huy Hoàng, 2026
+% ============================================================
+
+% ---- Phuzz (bài báo gốc) ----
+@inproceedings{neef2024phuzz,
+  author    = {Sebastian Neef and Lorenz Kleissner and Jean-Pierre Seifert},
+  title     = {What All the {Phuzz} Is About: A Coverage-guided Fuzzer for Finding
+               Vulnerabilities in {PHP} Web Applications},
+  booktitle = {Proceedings of ACM ASIA Conference on Computer and Communications
+               Security (AsiaCCS'24)},
+  year      = {2024},
+  publisher = {ACM},
+  address   = {Singapore}
+}
+
+% ---- Fuzzing surveys ----
+@article{li2018fuzzing,
+  author  = {Jun Li and Bodong Zhao and Chao Zhang},
+  title   = {Fuzzing: a survey},
+  journal = {Cybersecurity},
+  volume  = {1},
+  number  = {1},
+  year    = {2018},
+  doi     = {10.1186/s42400-018-0002-y}
+}
+
+@article{manes2021art,
+  author  = {Valentin J.M. Manes and HyungSeok Han and Choongwoo Han and
+             Sang Kil Cha and Manuel Egele and Edward J. Schwartz and Maverick Woo},
+  title   = {The Art, Science, and Engineering of Fuzzing: A Survey},
+  journal = {IEEE Transactions on Software Engineering},
+  volume  = {47},
+  number  = {11},
+  pages   = {2312--2331},
+  year    = {2021},
+  doi     = {10.1109/tse.2019.2946563}
+}
+
+@article{zhu2022fuzzing,
+  author  = {Xiaogang Zhu and Sheng Wen and Seyit Camtepe and Yang Xiang},
+  title   = {Fuzzing: A Survey for Roadmap},
+  journal = {ACM Computing Surveys},
+  volume  = {54},
+  number  = {11s},
+  pages   = {1--36},
+  year    = {2022},
+  doi     = {10.1145/3512345}
+}
+
+% ---- AFL / AFL++ / Honggfuzz ----
+@inproceedings{fioraldi2020afl,
+  author    = {Andrea Fioraldi and Dominik Maier and Heiko Ei{\ss}feldt and Marc Heuse},
+  title     = {{AFL++}: Combining Incremental Steps of Fuzzing Research},
+  booktitle = {Proceedings of the 14th USENIX Conference on Offensive Technologies},
+  year      = {2020},
+  publisher = {USENIX Association},
+  pages     = {10--10}
+}
+
+@misc{zalewski2014afl,
+  author = {Michal Zalewski},
+  title  = {American Fuzzy Lop},
+  year   = {2014},
+  howpublished = {\url{https://lcamtuf.coredump.cx/afl/}}
+}
+
+@misc{google2023honggfuzz,
+  author       = {{Google LLC}},
+  title        = {Honggfuzz: Security Oriented Software Fuzzer},
+  year         = {2023},
+  howpublished = {\url{https://github.com/google/honggfuzz}}
+}
+
+% ---- Whitebox / symbolic / taint ----
+@inproceedings{godefroid2008automated,
+  author    = {Patrice Godefroid and Michael Y. Levin and David A. Molnar},
+  title     = {Automated Whitebox Fuzz Testing},
+  booktitle = {Proceedings of the Network and Distributed System Security Symposium (NDSS)},
+  volume    = {8},
+  year      = {2008},
+  pages     = {151--166}
+}
+
+@inproceedings{ganesh2009taint,
+  author    = {Vijay Ganesh and Tim Leek and Martin Rinard},
+  title     = {Taint-based Directed Whitebox Fuzzing},
+  booktitle = {2009 IEEE 31st International Conference on Software Engineering},
+  year      = {2009},
+  pages     = {474--484},
+  doi       = {10.1109/icse.2009.5070546}
+}
+
+@inproceedings{godefroid2007random,
+  author    = {Patrice Godefroid},
+  title     = {Random Testing for Security},
+  booktitle = {Proceedings of the 2nd International Workshop on Random Testing
+               (co-located with ASE 2007)},
+  year      = {2007},
+  pages     = {1},
+  doi       = {10.1145/1292414.1292416}
+}
+
+% ---- Web fuzzing related work ----
+@inproceedings{doupe2010johnny,
+  author    = {Adam Doup{\'e} and Marco Cova and Giovanni Vigna},
+  title     = {Why Johnny Can't Pentest: An Analysis of Black-box Web
+               Vulnerability Scanners},
+  booktitle = {Detection of Intrusions and Malware, and Vulnerability Assessment
+               (DIMVA 2010)},
+  year      = {2010},
+  publisher = {Springer},
+  pages     = {111--131}
+}
+
+@inproceedings{vanrooij2021webfuzz,
+  author    = {Orpheas van Rooij and Marcos Antonios Charalambous and
+               Demetris Kaizer and Michalis Papaevripides and Elias Athanasopoulos},
+  title     = {{webFuzz}: Grey-box Fuzzing for Web Applications},
+  booktitle = {Computer Security -- ESORICS 2021 (Part I)},
+  year      = {2021},
+  publisher = {Springer},
+  pages     = {152--172}
+}
+
+@inproceedings{trickel2023witcher,
+  author    = {Erik Trickel and Fabio Pagani and Chang Zhu and Lukas Dresel and
+               Giovanni Vigna and Christopher Kruegel and Ruoyu Wang and
+               Tiffany Bao and Yan Shoshitaishvili and Adam Doup{\'e}},
+  title     = {Toss a Fault to Your Witcher: Applying Grey-box Coverage-guided
+               Mutational Fuzzing to Detect {SQL} and Command Injection Vulnerabilities},
+  booktitle = {2023 IEEE Symposium on Security and Privacy (SP)},
+  year      = {2023},
+  publisher = {IEEE},
+  pages     = {116--133}
+}
+
+% ---- OWASP ----
+@misc{owasp2021top10,
+  author       = {{OWASP Foundation}},
+  title        = {{OWASP} Top 10:2021},
+  year         = {2021},
+  howpublished = {\url{https://owasp.org/Top10/}}
+}
+
+@misc{owasp2023ssrf,
+  author       = {{OWASP Foundation}},
+  title        = {Server Side Request Forgery Prevention Cheat Sheet},
+  year         = {2023},
+  howpublished = {\url{https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html}}
+}
+
+% ---- Công cụ bảo mật ----
+@misc{portswigger2023burp,
+  author       = {{PortSwigger}},
+  title        = {Burp Suite Professional},
+  year         = {2023},
+  howpublished = {\url{https://portswigger.net/burp/pro}}
+}
+
+@misc{zapdevteam2023,
+  author       = {{ZAP Dev Team}},
+  title        = {{OWASP ZAP}},
+  year         = {2023},
+  howpublished = {\url{https://www.zaproxy.org/}}
+}
+
+% ---- PHP ecosystem ----
+@misc{phpgroup2023uopz,
+  author       = {{The PHP Group}},
+  title        = {{PHP}: uopz -- Manual},
+  year         = {2023},
+  howpublished = {\url{https://www.php.net/manual/en/book.uopz.php}}
+}
+
+@misc{rethans2002xdebug,
+  author       = {Derick Rethans},
+  title        = {Xdebug: Code Coverage Analysis},
+  year         = {2002},
+  howpublished = {\url{https://xdebug.org/docs/code_coverage}}
+}
+
+@misc{watkins2023pcov,
+  author       = {Joe Watkins},
+  title        = {{PCOV} -- CodeCoverage Compatible Driver for {PHP}},
+  year         = {2023},
+  howpublished = {\url{https://github.com/krakjoe/pcov/}}
+}
+
+@misc{phpgroup2023history,
+  author       = {{The PHP Group}},
+  title        = {{PHP}: History of {PHP} -- Manual},
+  year         = {2023},
+  howpublished = {\url{https://www.php.net/manual/en/history.php.php}}
+}
+
+% ---- Hạ tầng ----
+@misc{docker2023,
+  author       = {{Docker Inc.}},
+  title        = {Docker: Accelerated, Containerized Application Development},
+  year         = {2023},
+  howpublished = {\url{https://docker.com/}}
+}
+
+@misc{microsoft2024playwright,
+  author       = {{Microsoft}},
+  title        = {Playwright -- Fast and Reliable End-to-End Testing for Modern Web Apps},
+  year         = {2024},
+  howpublished = {\url{https://playwright.dev/}}
+}
+
+% ---- Miller 1988 (original fuzzing paper) ----
+@article{miller1990empirical,
+  author  = {Barton P. Miller and Lars Fredriksen and Bryan So},
+  title   = {An Empirical Study of the Reliability of {UNIX} Utilities},
+  journal = {Communications of the ACM},
+  volume  = {33},
+  number  = {12},
+  pages   = {32--44},
+  month   = dec,
+  year    = {1990},
+  doi     = {10.1145/96267.96279}
+}
+
+% ---- AFLFast ----
+@inproceedings{bohme2016coverage,
+  author    = {Marcel B{\"o}hme and Van-Thuan Pham and Abhik Roychoudhury},
+  title     = {Coverage-based Greybox Fuzzing as Markov Chain},
+  booktitle = {Proceedings of the 23rd ACM SIGSAC Conference on Computer
+               and Communications Security (CCS '16)},
+  year      = {2016},
+  publisher = {ACM},
+  pages     = {1032--1043},
+  doi       = {10.1145/2976749.2978428}
+}
+
+% ---- W3Techs PHP market share ----
+@misc{w3techs2023php,
+  author       = {{Q-Success Web-Quality GmbH}},
+  title        = {Usage Statistics and Market Share of {PHP} for Websites},
+  howpublished = {W3Techs -- Web Technology Surveys},
+  year         = {2023},
+  note         = {[Online]. Available: \url{https://w3techs.com/technologies/details/pl-php}}
+}

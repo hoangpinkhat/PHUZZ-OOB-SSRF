@@ -32,6 +32,11 @@ if [[ ${WP_TARGET_PLUGIN} == 'udraw' ]]; then
 fi
 ./wp-cli.phar plugin install ./_plugins/${WP_TARGET_PLUGIN}.zip --activate
 
+# Create subscriber user for CVE-2023-2249 (WPForo needs subscriber auth)
+if [[ "${WP_TARGET_PLUGIN}" == wpforo* ]]; then
+./wp-cli.phar user create subscriber1 sub@localhost.local --role=subscriber --user_pass=subscriber1 2>/dev/null || true
+fi
+
 # SQLi (5/5)
 #./wp-cli.phar plugin install ./_plugins/kivicare-clinic-management-system.2.3.8.zip --activate # --version=2.3.8 # SQLi https://wpscan.com//vulnerability/53f493e9-273b-4349-8a59-f2207e8f8f30
 #./wp-cli.phar plugin install ./_plugins/nirweb-support.2.7.6.zip --activate # --version=2.7.6 # SQLi https://wpscan.com//vulnerability/1a8f9c7b-a422-4f45-a516-c3c14eb05161

@@ -1,0 +1,102 @@
+name: phuzz-btslab-ssrf
+
+services:
+
+  phuzz-oob:
+    build:
+      context: ./oob
+      dockerfile: Dockerfile
+    volumes:
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8000:8000"
+    networks:
+      phuzz-net:
+        ipv4_address: 172.21.0.10
+
+  phuzz-db:
+    image: mysql:8
+    command: mysqld
+    environment:
+      MYSQL_DATABASE:      bts
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_HOST:     "%"
+    networks:
+      phuzz-net:
+        aliases:
+          - db
+
+  phuzz-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE:     btslab
+      FUZZER_COVERAGE_PATH: /var/www/html/vulnerability/ssrf/
+      FUZZER_COMPRESS:      0
+      REQUIRES_DB:          1
+      DB_HOST:              db
+      FUZZER_OOB_HOST:      172.21.0.10
+    volumes:
+      - ./web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8080:80"
+    networks:
+      phuzz-net:
+        aliases:
+          - web
+    depends_on:
+      - phuzz-db
+      - phuzz-oob
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared-tmpfs/web-paths.txt"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  phuzz-fuzzer:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   1
+      FUZZER_CONFIG:    btslab/ssrf
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+      FUZZER_OOB_HOST:  172.21.0.10
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+      phuzz-oob:
+        condition: service_started
+    networks:
+      - phuzz-net
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type:   tmpfs
+      device: tmpfs
+      o:      "size=512m,uid=1000"
+
+  sync-tmpfs:
+    driver: local
+    driver_opts:
+      type:   tmpfs
+      device: tmpfs
+      o:      "size=256m,uid=1000"
+
+networks:
+  phuzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24

@@ -1,0 +1,584 @@
+﻿\chapter{Giới thiệu}
+
+Chương này trình bày bối cảnh và động lực nghiên cứu của khóa luận, khảo sát các
+phương pháp kiểm thử bảo mật ứng dụng web hiện có, đánh giá các công cụ tiêu biểu,
+phân tích đặc thù của lỗ hổng Blind SSRF, xác định khoảng trống còn tồn tại và đề
+xuất hướng giải quyết.
+Phần~\ref{sec:motivation} mô tả bối cảnh và lý do chọn đề tài.
+Phần~\ref{sec:methods-overview} khảo sát các phương pháp kiểm thử bảo mật chính.
+Phần~\ref{sec:existing-tools} đánh giá các công cụ tiêu biểu hiện có.
+Phần~\ref{sec:ssrf-challenge} phân tích đặc thù của lỗ hổng SSRF và Blind SSRF.
+Phần~\ref{sec:gap} xác định khoảng trống nghiên cứu và hướng tiếp cận đề xuất.
+Phần~\ref{sec:objectives} phát biểu mục tiêu và phạm vi.
+Phần~\ref{sec:contributions} liệt kê các đóng góp kỹ thuật của khóa luận.
+Phần~\ref{sec:structure} trình bày cấu trúc khóa luận.
+
+% ============================================================
+\section{Bối cảnh và Lý do Chọn Đề tài}
+\label{sec:motivation}
+% ============================================================
+
+\subsection{Tầm quan trọng của Ứng dụng Web và Bảo mật}
+
+Ứng dụng web ngày nay là hạ tầng số không thể thiếu của hầu hết các tổ chức. Từ
+ngân hàng trực tuyến, thương mại điện tử, đến hệ thống quản lý nhà nước và hồ sơ y
+tế điện tử, logic nghiệp vụ cốt lõi đều được hiện thực hóa dưới dạng web application
+chạy trên nền HTTP/HTTPS. Sự phức tạp ngày càng tăng của các hệ thống này kéo theo
+bề mặt tấn công rộng hơn: một nền tảng SaaS hiện đại có thể tích hợp hàng chục
+microservice nội bộ, gọi tới nhiều API bên thứ ba, xử lý tệp đính kèm từ người dùng,
+và tương tác với cơ sở dữ liệu với đặc quyền cao. Mỗi điểm tích hợp đó đều là một
+bề mặt tấn công tiềm năng.
+
+PHP là ngôn ngữ lập trình phổ biến nhất phía server trong hệ sinh thái web, được sử
+dụng bởi hơn 77\% các website có ngôn ngữ server-side đã biết tính đến năm
+2023~\cite{w3techs2023php}, bao gồm các nền tảng lớn như WordPress (chiếm hơn
+43\% website toàn cầu), Drupal, Magento và Joomla. Hệ sinh thái plugin của WordPress
+--- với hơn 60.000 plugin từ bên thứ ba, mỗi plugin là một bề mặt tấn công tiềm năng
+--- là nguồn sinh ra liên tục các lỗ hổng bảo mật mới được công bố dưới dạng CVE
+(Common Vulnerabilities and Exposures). Sự kết hợp giữa mức độ phổ biến cao của PHP
+và hệ sinh thái plugin thiếu kiểm soát tạo ra môi trường màu mỡ cho kẻ tấn công,
+đồng thời đặt ra thách thức lớn cho kiểm thử bảo mật tự động.
+
+Trong bối cảnh đó, kiểm thử bảo mật tự động --- đặc biệt là kỹ thuật \textit{fuzzing}
+--- đã trở thành một hướng nghiên cứu quan trọng, được áp dụng rộng rãi trong cả môi
+trường học thuật lẫn công nghiệp~\cite{manes2021art, zhu2022fuzzing}. Tuy nhiên, như
+phân tích trong các phần tiếp theo sẽ chỉ ra, một lớp lỗ hổng nguy hiểm và ngày càng
+phổ biến --- Blind SSRF --- vẫn nằm ngoài tầm quan sát của toàn bộ thế hệ công cụ
+kiểm thử tự động hiện tại.
+
+\subsection{SSRF và Vị trí trong OWASP Top 10}
+
+Server-Side Request Forgery (SSRF) là lớp lỗ hổng bảo mật trong đó kẻ tấn công
+khiến máy chủ ứng dụng thực hiện các yêu cầu mạng tùy ý tới địa chỉ do kẻ tấn công
+kiểm soát~\cite{owasp2021top10}. SSRF đã leo lên vị trí thứ mười trong danh sách
+OWASP Top 10:2021 --- lần đầu tiên được đưa vào danh sách này với tư cách một mục
+riêng biệt, không ghép với các lỗ hổng khác. OWASP ghi nhận rằng dù tỷ lệ xuất hiện
+của SSRF còn khiêm tốn so với SQLi hay XSS, tỷ lệ khai thác thành công lại cao hơn
+đáng kể, vì SSRF thường khai thác tin tưởng ngầm giữa các thành phần trong hạ tầng
+nội bộ --- máy chủ web thường được phép truy cập các dịch vụ nội bộ như Redis,
+Elasticsearch, hay cloud metadata endpoint mà không qua xác thực, vì chúng vốn không
+được thiết kế để tiếp xúc trực tiếp với Internet.
+
+Tác động của SSRF đặc biệt nghiêm trọng trong kiến trúc đám mây. Sự cố Capital One
+năm 2019 --- một trong những vụ rò rỉ dữ liệu ngân hàng lớn nhất lịch sử với hơn
+100 triệu hồ sơ khách hàng bị ảnh hưởng --- được kích hoạt thông qua SSRF tới
+instance metadata service (IMDS) của AWS (địa chỉ \texttt{169.254.169.254}), cho
+phép kẻ tấn công lấy IAM credentials tạm thời và truy cập S3 bucket chứa dữ liệu
+nhạy cảm~\cite{owasp2023ssrf}. Sự cố này cho thấy SSRF không chỉ là lỗ hổng lý
+thuyết mà có thể dẫn đến hậu quả thực tế nghiêm trọng ở quy mô lớn.
+
+\subsection{Blind SSRF --- Điểm mù của Kiểm thử Tự động}
+
+Dạng nguy hiểm và khó phát hiện nhất của SSRF là \textit{Blind SSRF}: máy chủ thực
+hiện network request nhưng không phản ánh response về cho người dùng --- ứng dụng
+xử lý kết quả nội bộ, loại bỏ, hoặc chỉ ghi log. Từ góc độ giao thức HTTP, mọi thứ
+có vẻ bình thường: không có error message, không có status code bất thường, không có
+nội dung khác biệt trong response. Dấu hiệu duy nhất tồn tại ở tầng mạng --- máy
+chủ đã khởi tạo một kết nối ra ngoài tới địa chỉ mà kẻ tấn công kiểm soát. Điều
+này đặc biệt phổ biến trong các kịch bản: xác nhận webhook (ứng dụng gọi URL để
+kiểm tra tính hợp lệ nhưng không trả về nội dung), background processing (SSRF được
+kích hoạt bởi job bất đồng bộ), hay tích hợp dịch vụ (ứng dụng tự động lấy metadata
+từ URL người dùng cung cấp).
+
+Chính đặc điểm vô hình này khiến Blind SSRF trở thành điểm mù lớn nhất của hầu hết
+công cụ kiểm thử bảo mật tự động hiện có. Không một greybox fuzzer nào ---
+Phuzz~\cite{neef2024phuzz}, webFuzz~\cite{vanrooij2021webfuzz}, hay
+Witcher~\cite{trickel2023witcher} --- có cơ chế để quan sát hành vi mạng của ứng
+dụng mục tiêu vượt ra ngoài HTTP response và code coverage. Khóa luận này xuất phát
+từ quan sát đó và đề xuất một hướng tiếp cận có hệ thống để lấp khoảng trống: tích
+hợp kênh tín hiệu \textit{Out-of-Band} (OOB) vào vòng lặp greybox fuzzing, biến một
+máy chủ lắng nghe bên ngoài thành một kênh phản hồi độc lập cho fuzzer.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Sơ đồ luồng tấn công SSRF điển hình.
+    % Bên trái: Attacker gửi HTTP request chứa URL độc hại (url=http://169.254.169.254/...).
+    % Ở giữa: Web Server / Ứng dụng PHP nhận request, gọi file_get_contents($url).
+    % Bên phải: Các dịch vụ nội bộ bị tấn công: AWS Metadata (169.254.169.254),
+    %           Redis (:6379), Elasticsearch (:9200), Admin panel (/admin).
+    % Mũi tên: Attacker → Web App (HTTP/HTTPS public), Web App → Internal (qua tường lửa nội bộ).
+    % Ghi chú: Firewall cho phép web app kết nối nội bộ nhưng chặn truy cập trực tiếp từ Internet.
+    \includegraphics[width=0.88\textwidth]{figures/fig-ssrf-flow}
+    \caption{Luồng tấn công SSRF.}
+    \label{fig:ssrf-flow}
+\end{figure}
+
+% ============================================================
+\section{Phương pháp Kiểm thử Bảo mật Ứng dụng Web}
+\label{sec:methods-overview}
+% ============================================================
+
+Kiểm thử bảo mật ứng dụng web đã phát triển qua nhiều thế hệ công cụ và phương
+pháp~\cite{li2018fuzzing, manes2021art}. Mỗi cách tiếp cận có điểm mạnh và hạn chế
+riêng, đặc biệt khi đối mặt với các lớp lỗ hổng không để lại dấu vết hiển thị như
+Blind SSRF.
+
+\subsection{Phân tích Tĩnh}
+
+Phân tích tĩnh (static analysis) kiểm tra mã nguồn mà không cần thực thi chương
+trình. Đối với PHP, phân tích tĩnh có thể truy vết luồng dữ liệu (taint analysis)
+từ điểm nhập (source) như \texttt{\$\_GET['url']} tới điểm sink nguy hiểm như
+\texttt{file\_get\_contents(\$url)}. Phân tích tĩnh là bước đầu tiên hữu ích trong
+pipeline kiểm thử bảo mật: chi phí thấp, không yêu cầu triển khai ứng dụng, và có
+thể tích hợp vào quy trình CI/CD.
+
+Tuy nhiên, phân tích tĩnh gặp khó khăn với \textit{context-sensitive taint tracking}
+qua nhiều tầng framework: trong một WordPress plugin, đầu vào người dùng thường đi
+qua nhiều lớp abstraction trước khi đến sink. Phân tích tĩnh không thể đánh giá hành
+vi runtime --- một URL có bị lọc hay không phụ thuộc vào logic điều kiện và cấu hình
+runtime, không thể suy luận từ code tĩnh. Kết quả là tỷ lệ false positive cao và
+false negative đáng kể với các lỗ hổng phức tạp.
+
+\subsection{Thực thi Tượng trưng và Concolic Execution}
+
+Thực thi tượng trưng (symbolic execution) thay thế các giá trị cụ thể bằng biểu thức
+tượng trưng và giải các ràng buộc để tìm đầu vào kích hoạt mọi nhánh
+code~\cite{godefroid2008automated}. Kỹ thuật này có khả năng đạt độ phủ lý thuyết
+cao và xác định chính xác điều kiện kích hoạt lỗ hổng. Concolic execution kết hợp
+thực thi cụ thể và tượng trưng~\cite{ganesh2009taint}, giảm bớt vấn đề ``path
+explosion'' nhưng vẫn tốn kém về mặt tính toán.
+
+Với ứng dụng web PHP thực tế --- hàng nghìn dòng code, framework phức tạp, tương tác
+database, và nhiều dependency bên thứ ba --- chi phí tính toán của symbolic execution
+trở nên không khả thi. Ngoài ra, các lời gọi hàm ngoài (như \texttt{curl\_exec})
+phụ thuộc vào môi trường runtime thực tế (phản hồi từ OOB server), điều mà symbolic
+execution không thể mô phỏng mà không có môi trường thực thi cụ thể.
+
+\subsection{Kiểm thử Hộp đen (Blackbox)}
+
+Kiểm thử blackbox không có bất kỳ thông tin nào về cấu trúc bên trong ứng dụng ---
+công cụ chỉ tương tác qua giao thức HTTP, quan sát đầu ra để phát hiện bất thường.
+Ưu điểm là dễ triển khai, không cần mã nguồn, và áp dụng được cho bất kỳ ứng dụng
+web nào. Nhược điểm cơ bản là khả năng khám phá code path bị giới hạn bởi những gì
+quan sát được từ response. Doupe và cộng sự~\cite{doupe2010johnny} đã chứng minh
+rằng blackbox scanner bỏ sót đáng kể các lỗ hổng đòi hỏi nhiều bước tương tác hoặc
+phụ thuộc vào trạng thái session phức tạp.
+
+\subsection{Kiểm thử Greybox và Coverage-Guided Fuzzing}
+
+Greybox fuzzing khai thác thông tin thực thi thu thập được trong quá trình chạy ---
+chủ yếu là code coverage --- làm tín hiệu phản hồi để định hướng quá trình sinh đột
+biến~\cite{fioraldi2020afl, zalewski2014afl}. AFL (American Fuzzy Lop) và sau đó là
+AFL++~\cite{fioraldi2020afl} đã chứng minh tính hiệu quả của cách tiếp cận này cho
+ứng dụng nhị phân. Các công trình gần đây nhất về kiểm thử bảo mật web tự động ---
+webFuzz~\cite{vanrooij2021webfuzz}, Witcher~\cite{trickel2023witcher}, và
+Phuzz~\cite{neef2024phuzz} --- đều theo hướng greybox fuzzing vì đây là cân bằng tốt
+nhất giữa chi phí và hiệu quả: không yêu cầu mã nguồn đầy đủ như whitebox, không bị
+giới hạn bởi oracle response như blackbox, và mở rộng tốt hơn symbolic execution.
+
+Bảng~\ref{tab:method-comparison} so sánh bốn phương pháp theo các tiêu chí quan
+trọng với bài toán phát hiện Blind SSRF.
+
+\begin{table}[h]{So sánh các phương pháp kiểm thử bảo mật theo các tiêu chí liên quan
+đến phát hiện Blind SSRF}
+\label{tab:method-comparison}
+\centering
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Tiêu chí} & \textbf{Tĩnh} & \textbf{Symbolic} & \textbf{Blackbox} & \textbf{Greybox} \\
+\hline
+Không cần mã nguồn     & \ding{55} & \ding{55} & \checkmark & \checkmark \\
+Khả năng mở rộng       & Tốt & Kém & Tốt & Tốt \\
+Phủ code path sâu      & Hạn chế & Cao & Thấp & Trung bình–cao \\
+Phát hiện runtime sink & \ding{55} & Có thể & \checkmark & \checkmark \\
+Tích hợp kênh OOB      & \ding{55} & \ding{55} & Bán thủ công & \textbf{Có thể} \\
+\hline
+\end{tabular}
+\end{table}
+
+Bảng~\ref{tab:method-comparison} cho thấy greybox fuzzing là nền tảng phù hợp nhất
+để tích hợp kênh OOB: nó đã có vòng lặp tự động, có khả năng thu thập tín hiệu
+runtime, và không phụ thuộc vào mã nguồn. Cần thiết kế thêm kênh OOB song song với
+coverage --- đây là đóng góp kỹ thuật của khóa luận này.
+
+% ============================================================
+\section{Thực trạng Công cụ Kiểm thử Bảo mật Hiện có}
+\label{sec:existing-tools}
+% ============================================================
+
+\subsection{Công cụ Blackbox}
+
+\textbf{OWASP ZAP (Zed Attack Proxy)~\cite{zapdevteam2023}} là công cụ kiểm thử
+bảo mật web mã nguồn mở được sử dụng rộng rãi nhất, cung cấp cả chế độ thủ công và
+tự động hóa qua API và daemon mode. ZAP thực hiện spider để khám phá endpoint, sau đó
+gửi payload chèn sẵn và phân tích HTTP response để phát hiện SQLi, XSS, path
+traversal, và một số lớp lỗ hổng khác. ZAP không tích hợp kênh OOB, do đó không thể
+phát hiện Blind SSRF.
+
+\textbf{Burp Suite Professional~\cite{portswigger2023burp}} cung cấp tính năng Burp
+Collaborator --- một infrastructure OOB cho phép phát hiện Blind SSRF, Blind SQLi, và
+Blind XXE trong kiểm thử bán thủ công. Khi kiểm thử viên chèn Collaborator payload
+vào tham số, bất kỳ interaction nào từ ứng dụng mục tiêu tới Collaborator server đều
+được ghi nhận và báo cáo. Đây là tính năng mạnh nhưng đòi hỏi sự chủ động của kiểm
+thử viên --- chọn endpoint, đặt payload, theo dõi kết quả --- không phải tự động hóa
+hoàn toàn theo nghĩa của fuzzing.
+
+\subsection{Công cụ Greybox Fuzzing cho Web}
+
+\textbf{webFuzz~\cite{vanrooij2021webfuzz}} (ESORICS 2021) là một trong những greybox
+fuzzer web đầu tiên được công bố. webFuzz thu thập coverage bằng cách instrument
+JavaScript phía client và HTML response, tập trung chủ yếu vào phát hiện XSS.
+webFuzz không hỗ trợ phát hiện các lỗ hổng server-side như SSRF, SQLi hay command
+injection do không có instrumentation phía server.
+
+\textbf{Witcher~\cite{trickel2023witcher}} (IEEE S\&P 2023) mở rộng greybox fuzzing
+cho PHP bằng cách sử dụng taint analysis để theo dõi luồng dữ liệu từ input tới các
+sink nguy hiểm. Witcher đạt kết quả đáng kể cho SQLi và command injection nhưng hoàn
+toàn không có cơ chế phát hiện SSRF vì không có hook trên các hàm mạng và không có
+kênh OOB.
+
+\textbf{Phuzz~\cite{neef2024phuzz}} (AsiaCCS 2024) là greybox fuzzer PHP toàn diện
+nhất hiện tại, hỗ trợ phát hiện sáu loại lỗ hổng server-side (SQLi, RCE, path
+traversal, insecure deserialization, XXE, open redirect) và XSS phía client. Trong
+bộ benchmark 87 lỗ hổng, Phuzz đạt tỷ lệ phát hiện 99\%. Tuy nhiên, như chính bài
+báo gốc thừa nhận, SSRF --- đặc biệt Blind SSRF --- hoàn toàn nằm ngoài khả năng
+phát hiện của Phuzz. Bài báo liệt kê SSRF là mục tiêu ưu tiên cao nhất trong phần
+Future Work, với ghi chú cụ thể: \textit{``The SSRF could have been found by Phuzz,
+if \texttt{wp\_remote\_get} was hooked and included in the vulnerability detection.''}
+
+\subsection{Tổng hợp So sánh}
+
+Bảng~\ref{tab:tool-comparison} tổng hợp khả năng phát hiện SSRF và Blind SSRF của
+các công cụ tiêu biểu, làm rõ khoảng trống mà khóa luận này hướng tới lấp đầy.
+
+\begin{table}[h]{So sánh khả năng phát hiện Blind SSRF của các công cụ kiểm thử
+bảo mật ứng dụng web tiêu biểu}
+\label{tab:tool-comparison}
+\centering
+\begin{tabular}{|l|l|c|c|c|}
+\hline
+\textbf{Công cụ} & \textbf{Loại} & \textbf{SSRF} & \textbf{Blind SSRF} & \textbf{Tự động} \\
+\hline
+OWASP ZAP~\cite{zapdevteam2023}       & Blackbox & Hạn chế   & \ding{55}   & \checkmark \\
+Burp Suite~\cite{portswigger2023burp} & Blackbox & \checkmark & \checkmark & Bán tự động \\
+webFuzz~\cite{vanrooij2021webfuzz}    & Greybox  & \ding{55}  & \ding{55}  & \checkmark \\
+Witcher~\cite{trickel2023witcher}      & Greybox  & \ding{55}  & \ding{55}  & \checkmark \\
+Phuzz~\cite{neef2024phuzz}            & Greybox  & \ding{55}  & \ding{55}  & \checkmark \\
+\textbf{Phuzz+OOB (đề xuất)}          & Greybox  & \checkmark & \checkmark & \checkmark \\
+\hline
+\end{tabular}
+\end{table}
+
+Bảng~\ref{tab:tool-comparison} cho thấy rõ khoảng trống: không có greybox fuzzer nào
+có thể phát hiện Blind SSRF một cách tự động. Burp Suite có khả năng này nhưng đòi
+hỏi can thiệp thủ công đáng kể; tất cả greybox fuzzer hoàn toàn mù với SSRF vì thiếu
+kênh tín hiệu OOB.
+
+% ============================================================
+\section{Lỗ hổng SSRF và Thách thức Phát hiện Tự động}
+\label{sec:ssrf-challenge}
+% ============================================================
+
+\subsection{Nguyên lý và Phân loại SSRF}
+
+Lỗ hổng SSRF phát sinh khi ứng dụng web nhận URL hay hostname từ đầu vào người dùng
+và dùng nó làm tham số cho một hàm mạng phía server mà không xác thực đầy đủ. Kẻ
+tấn công có thể truyền URL trỏ tới:
+
+\begin{itemize}
+    \item \textbf{Hệ thống nội bộ}: \texttt{http://192.168.1.1/admin} --- tường lửa
+    chặn truy cập từ Internet nhưng không chặn từ chính máy chủ ứng dụng, vì máy chủ
+    ứng dụng được coi là tin cậy trong mạng nội bộ.
+    \item \textbf{Cloud metadata endpoint}: \texttt{http://169.254.169.254/latest/\\meta-data/iam/security-credentials/}
+    --- đọc IAM credentials của AWS EC2 instance, dẫn tới chiếm quyền toàn bộ tài
+    khoản cloud.
+    \item \textbf{Dịch vụ nội bộ không xác thực}: Redis, Elasticsearch, Jenkins,
+    Kibana thường không yêu cầu xác thực khi truy cập từ mạng nội bộ, vì chúng không
+    được thiết kế để tiếp xúc trực tiếp với Internet.
+    \item \textbf{Leo thang thành RCE}: Kết hợp SSRF với Gopher protocol và Redis RESP
+    injection để ghi SSH key hoặc thực thi lệnh shell tùy ý trên máy chủ.
+\end{itemize}
+
+Theo mức độ quan sát được từ bên ngoài, SSRF chia thành hai dạng chính:
+\textit{Regular SSRF} (in-band) khi response của request phía server được phản ánh
+một phần hoặc toàn bộ trong HTTP response trả về cho người dùng; và \textit{Blind
+SSRF} khi ứng dụng thực hiện request nhưng không trả kết quả ra ngoài --- xử lý nội
+bộ, ghi log, hoặc chỉ kiểm tra trạng thái kết nối.
+
+\subsection{Kỹ thuật Bypass Filter SSRF}
+
+Nhiều ứng dụng cố gắng ngăn chặn SSRF bằng blocklist địa chỉ IP nội bộ
+(127.0.0.1, 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12). Kẻ tấn công có thể vượt
+qua bằng nhiều kỹ thuật:
+
+\begin{itemize}
+    \item \textbf{Biểu diễn IP thay thế}: \texttt{0x7f000001} (hex),
+    \texttt{2130706433} (decimal), \texttt{0177.0.0.1} (octal) đều biểu diễn
+    127.0.0.1 nhưng thường qua được kiểm tra regex đơn giản.
+    \item \textbf{IPv6}: \texttt{::1} hay \texttt{[::ffff:127.0.0.1]} thường bị bỏ
+    sót trong blocklist chỉ kiểm tra IPv4.
+    \item \textbf{URL encoding}: \texttt{\%31\%32\%37.\%30.\%30.\%31} hay
+    double-encoding có thể bypass kiểm tra chuỗi thô.
+    \item \textbf{DNS-based redirect}: Domain của attacker trỏ về IP nội bộ; hoặc
+    dùng các dịch vụ như \texttt{nip.io}/\texttt{sslip.io} --- ví dụ
+    \texttt{127.0.0.1.nip.io} phân giải thành \texttt{127.0.0.1}.
+    \item \textbf{DNS rebinding}: Domain ban đầu trỏ về IP public để qua kiểm tra;
+    sau khi TTL hết, DNS rebind thành địa chỉ nội bộ. Kỹ thuật này bypass cả các
+    kiểm tra IP được thực hiện trước khi gọi hàm mạng.
+    \item \textbf{Userinfo trick}: \texttt{http://trusted.com@172.20.0.10:8000/} ---
+    một số parser nhầm \texttt{172.20.0.10} là đường dẫn, không phải host.
+    \item \textbf{Scheme-less}: Ứng dụng tự prepend \texttt{https://} vào giá trị
+    tham số; bypass bằng cách chỉ cung cấp host không có scheme.
+    \item \textbf{Fragment bypass}: \texttt{http://172.20.0.10\#trusted.com} ---
+    fragment bị bỏ qua khi gửi request thực nhưng có thể đánh lừa validator.
+\end{itemize}
+
+Sự đa dạng của các kỹ thuật bypass là lý do tại sao một bộ mutator SSRF hiệu quả cần
+bao phủ nhiều biến thể, không chỉ plain IP. Chi tiết cụ thể về cài đặt các biến thể
+này trong \texttt{SSRFMutator} được trình bày ở Chương~3.
+
+\subsection{Tại sao Tín hiệu Truyền thống Không đủ}
+
+Bảng~\ref{tab:signal-comparison} so sánh các loại tín hiệu phản hồi mà công cụ kiểm
+thử tự động hiện tại có thể khai thác và khả năng áp dụng cho từng loại lỗ hổng.
+
+\begin{table}[h]{Tín hiệu phản hồi và khả năng phát hiện từng loại lỗ hổng
+(\checkmark = có tín hiệu, \ding{55} = không có tín hiệu)}
+\label{tab:signal-comparison}
+\centering
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Tín hiệu phản hồi} & \textbf{SQLi} & \textbf{XSS} & \textbf{SSRF} & \textbf{Blind SSRF} \\
+\hline
+Nội dung HTTP response          & \checkmark & \checkmark & \checkmark & \ding{55} \\
+HTTP status code bất thường     & \checkmark & \ding{55}  & Có thể     & \ding{55} \\
+Exception / thông báo lỗi       & \checkmark & \ding{55}  & Có thể     & \ding{55} \\
+Độ phủ mã (code coverage)       & \checkmark & \checkmark & \checkmark & \ding{55} \\
+\textbf{OOB network callback}   & \ding{55}  & \ding{55}  & \checkmark & \checkmark \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: So sánh hai kịch bản SSRF cạnh nhau (hai cột).
+    % Cột trái — Regular SSRF: Attacker → Web App → Internal Service → response nội dung
+    %   được phản ánh về Attacker trong HTTP response. Mũi tên khép kín.
+    % Cột phải — Blind SSRF: Attacker → Web App → Internal Service → response được xử lý
+    %   nội bộ hoặc ghi log; Attacker nhận HTTP 200 OK bình thường, không có nội dung bất thường.
+    %   Chỉ OOB Server (bên dưới, tách biệt) ghi nhận được kết nối từ Web App.
+    % Điểm nhấn: với Blind SSRF, tất cả tín hiệu truyền thống (response, status, coverage)
+    %   đều bình thường; chỉ OOB callback mới là bằng chứng.
+    \includegraphics[width=0.92\textwidth]{figures/fig-blind-vs-regular}
+    \caption{So sánh Regular SSRF và Blind SSRF.}
+    \label{fig:blind-vs-regular}
+\end{figure}
+
+Hình~\ref{fig:blind-vs-regular} và Bảng~\ref{tab:signal-comparison} cùng làm rõ vấn
+đề cốt lõi: với Blind SSRF, mọi tín
+hiệu truyền thống đều vắng mặt. Không có nội dung bất thường trong response, không
+có status code lạ, không có exception. Đặc biệt, code path thực thi hoàn toàn giống
+nhau dù URL trỏ tới OOB server hay một URL bình thường --- \texttt{file\_get\_contents}
+hay \texttt{curl\_exec} đều được gọi đúng một lần, không có nhánh code mới nào được
+kích hoạt. OOB network callback là tín hiệu \emph{duy nhất} có khả năng xác nhận
+Blind SSRF, và đây là lý do tại sao không có greybox fuzzer nào hiện tại có thể phát
+hiện được loại lỗ hổng này.
+
+\subsection{Đặc thù PHP và Bề mặt Tấn công SSRF}
+
+PHP cung cấp một bề mặt tấn công SSRF đặc biệt rộng do nhiều hàm đa năng có thể
+thực hiện HTTP request ngầm khi nhận URL làm đối số:
+
+\begin{itemize}
+    \item \textbf{Sink rõ ràng}: \texttt{curl\_exec()}, \texttt{fsockopen()},
+    \texttt{stream\_socket\_client()} --- hàm mạng tường minh, thường được kiểm thử
+    viên chú ý.
+    \item \textbf{Sink đa năng}: \texttt{file\_get\_contents()}, \texttt{fopen()},
+    \texttt{readfile()} --- vốn dùng để đọc file cục bộ nhưng âm thầm thực hiện
+    HTTP/FTP request khi nhận URL.
+    \item \textbf{Sink không trực quan}: \texttt{getimagesize()} --- thường dùng để
+    lấy kích thước ảnh, ít ai ngờ đây là SSRF sink. Thực tế lỗ hổng
+    CVE-2022-1751 (Skitter Slideshow) khai thác đúng sink này.
+    \item \textbf{Sink WordPress}: \texttt{wp\_remote\_get()},
+    \texttt{wp\_remote\_post()} --- tầng abstraction cao hơn, được nhiều plugin dùng
+    thay cho cURL, tạo ra sink gián tiếp không được bao phủ bởi hook tầng thấp nếu
+    không instrument riêng.
+\end{itemize}
+
+Ngoài ra, kịch bản Command Injection dẫn tới SSRF cũng đáng chú ý: khi input người
+dùng được truyền vào hàm shell như \texttt{shell\_exec()}, kẻ tấn công có thể chèn
+lệnh \texttt{curl} hoặc \texttt{wget} để thực hiện kết nối mạng tùy ý. Đây là một
+dạng SSRF gián tiếp qua tầng shell, cần bộ mutator và hook riêng biệt.
+
+% ============================================================
+\section{Khoảng trống Nghiên cứu và Hướng Giải quyết}
+\label{sec:gap}
+% ============================================================
+
+\subsection{Xác định Khoảng trống}
+
+Phân tích ở các phần trước xác định một khoảng trống cụ thể và rõ ràng trong công
+nghệ kiểm thử bảo mật hiện tại: \textit{không tồn tại greybox fuzzer nào tích hợp
+kênh tín hiệu OOB vào vòng lặp fuzzing để phát hiện Blind SSRF một cách tự động và
+không có false positive}.
+
+Khoảng trống này tồn tại do ba nguyên nhân có liên quan:
+
+\begin{enumerate}
+    \item \textbf{Giả định thiết kế}: Greybox fuzzer truyền thống được thiết kế với
+    giả định rằng tín hiệu phản hồi đến từ hai kênh: HTTP response và code coverage.
+    Cả hai kênh đều không phản ánh hành vi mạng ẩn của ứng dụng.
+    \item \textbf{Khoảng cách công nghệ}: Kỹ thuật OOB tồn tại trong công cụ kiểm
+    thử thủ công (Burp Collaborator) nhưng chưa được tích hợp vào vòng lặp fuzzing
+    tự động theo cách có hệ thống, với cơ chế tương quan token đảm bảo chính xác
+    trong môi trường song song.
+    \item \textbf{Thách thức kỹ thuật}: Phát hiện Blind SSRF trong fuzzing tự động
+    đặt ra bài toán không tầm thường --- cần tương quan nhân quả giữa hàng nghìn
+    request gửi song song và các OOB callback không đồng bộ, đồng thời tránh false
+    positive từ các kết nối mạng không liên quan.
+\end{enumerate}
+
+\subsection{Hướng Giải quyết Đề xuất}
+
+Khóa luận này đề xuất lấp khoảng trống đó bằng cách mở rộng Phuzz~\cite{neef2024phuzz}
+với ba thành phần mới được tích hợp theo cách không phá vỡ kiến trúc gốc:
+
+\begin{enumerate}
+    \item \textbf{Bộ đột biến SSRF chuyên biệt.} \texttt{SSRFMutator} sinh payload
+    OOB bao phủ 21 biến thể (IP-based, DNS-based, hostname-based) theo phương pháp
+    round-robin, đảm bảo đa dạng kỹ thuật bypass. \texttt{CmdInjectionSSRFMutator}
+    thêm 10 biến thể command injection cho các endpoint có nguy cơ gọi lệnh shell.
+    Thiết kế đa biến thể là cần thiết vì một số lỗ hổng chỉ phát hiện được qua đúng
+    một biến thể: ví dụ CVE-2020-28975 (Canto plugin) chỉ phát hiện qua biến thể
+    scheme-less, CVE-2021-32682 (elFinder) chỉ qua biến thể hostname-based.
+
+    \item \textbf{Máy chủ OOB lắng nghe độc lập.} Container \texttt{phuzz-oob} chạy
+    Flask HTTP/HTTPS listener (cổng 8000/8443) và dnsmasq với wildcard DNS
+    (\texttt{*.oob}), nhận callback từ ứng dụng mục tiêu và ghi log nguyên tử vào
+    shared-tmpfs. Thiết kế container độc lập cho phép tái sử dụng với bất kỳ ứng dụng
+    mục tiêu nào mà không cần sửa đổi.
+
+    \item \textbf{Module phát hiện hai tầng.} \texttt{SSRFVulnCheck} kết hợp tín hiệu
+    in-band (PHP hook qua UOPZ ghi nhận lời gọi hàm mạng với OOB payload) và tín hiệu
+    OOB (callback log từ OOB server) theo logic AND. Chỉ khi cả hai file bằng chứng
+    cùng tồn tại mới xác nhận lỗ hổng, đảm bảo zero false positive.
+\end{enumerate}
+
+Hướng tiếp cận này giải quyết đồng thời cả ba nguyên nhân của khoảng trống: bổ sung
+kênh tín hiệu thứ ba (OOB), tự động hóa hoàn toàn quá trình từ sinh payload đến xác
+nhận lỗ hổng, và đảm bảo tương quan chính xác qua cơ chế token 8 ký tự gắn với từng
+ứng viên.
+
+% ============================================================
+\section{Mục tiêu và Phạm vi Nghiên cứu}
+\label{sec:objectives}
+% ============================================================
+
+\subsection{Mục tiêu}
+
+Mục tiêu chính của khóa luận là thiết kế và cài đặt một hệ thống phát hiện Blind
+SSRF hoàn toàn tự động trong môi trường greybox fuzzing PHP, tích hợp vào framework
+Phuzz, với các tiêu chí đánh giá cụ thể:
+
+\begin{itemize}
+    \item \textbf{Tự động hóa hoàn toàn}: không yêu cầu can thiệp thủ công trong quá
+    trình fuzzing; hệ thống tự sinh payload, thu tín hiệu từ cả hai kênh, tương quan
+    OOB callback với request, xác nhận lỗ hổng và ghi report có cấu trúc.
+    \item \textbf{Không có false positive}: mỗi lỗ hổng chỉ được báo cáo khi có bằng
+    chứng mạng thực tế từ cả hai tầng tín hiệu (logic AND).
+    \item \textbf{Tương thích và không xâm lấn}: tích hợp hoàn toàn dưới dạng module
+    bổ sung, giữ nguyên toàn bộ chức năng phát hiện lỗ hổng gốc và cấu trúc code của
+    Phuzz.
+    \item \textbf{Bao phủ bề mặt tấn công}: payload bao gồm 21 biến thể SSRF và 10
+    biến thể command injection SSRF; PHP hook bao phủ 23 hàm trên 5 nhóm chức năng.
+    \item \textbf{Kiểm chứng thực nghiệm}: đánh giá trên cả ứng dụng lab và CVE thực
+    tế từ hệ sinh thái WordPress plugin.
+\end{itemize}
+
+\subsection{Phạm vi}
+
+\textbf{Trong phạm vi:}
+\begin{itemize}
+    \item Ứng dụng PHP (phiên bản 7.4 và 8.x) chạy trong môi trường Docker, bao gồm
+    cả ứng dụng WordPress với plugin bên thứ ba.
+    \item Lỗ hổng SSRF và Blind SSRF được kích hoạt qua tham số HTTP (query string,
+    POST form data, JSON body, HTTP header tùy chỉnh).
+    \item Phát hiện SSRF thông qua các hàm mạng PHP: \texttt{file\_get\_contents},
+    \texttt{curl\_exec}, \texttt{fsockopen}, \texttt{getimagesize}, các hàm WordPress
+    HTTP API, và các hàm shell execution (qua command injection chèn lệnh curl/wget).
+    \item Môi trường kiểm thử cục bộ (Docker network 172.20.0.0/24); OOB server
+    trong cùng mạng nội bộ với địa chỉ IP tĩnh 172.20.0.10.
+\end{itemize}
+
+\textbf{Ngoài phạm vi:}
+\begin{itemize}
+    \item Các ngôn ngữ server-side khác (Python, Node.js, Java, Ruby). Khóa luận
+    thảo luận khả năng mở rộng nhưng không cài đặt.
+    \item Stored SSRF --- trong đó payload được lưu vào database và kích hoạt SSRF ở
+    một request hoàn toàn khác sau đó. Khóa luận phân tích thách thức và đề xuất
+    hướng giải quyết ở Chương~5 nhưng không cài đặt đầy đủ.
+    \item Khai thác lỗ hổng (exploitation) sau khi phát hiện; khóa luận chỉ tập
+    trung vào giai đoạn phát hiện và xác nhận với bằng chứng mạng.
+    \item Phát hiện phân tán trên nhiều máy vật lý hoặc môi trường cloud production
+    với tường lửa egress nghiêm ngặt.
+\end{itemize}
+
+% ============================================================
+\section{Đóng góp của Khóa luận}
+\label{sec:contributions}
+% ============================================================
+
+Khóa luận có ba đóng góp kỹ thuật chính:
+
+\begin{enumerate}
+    \item \textbf{Bộ đột biến SSRF chuyên biệt.} \texttt{SSRFMutator} sinh
+    payload OOB bao phủ 21 biến thể (IP-based, DNS-based, hostname-based)
+    theo phương pháp round-robin, bao phủ các kỹ thuật bypass phổ biến nhất.
+    \texttt{CmdInjectionSSRFMutator} bổ sung 10 biến thể command injection
+    cho các endpoint có nguy cơ thực thi lệnh shell. Đây là bộ đột biến SSRF
+    đầu tiên được tích hợp vào vòng lặp greybox fuzzing tự động cho ứng
+    dụng PHP.
+
+    \item \textbf{Cơ sở hạ tầng OOB lắng nghe tích hợp.} Container
+    \texttt{phuzz-oob} cung cấp HTTP/HTTPS listener (cổng 8000/8443) và
+    dnsmasq với wildcard DNS (\texttt{*.oob}), nhận callback từ ứng dụng
+    mục tiêu và ghi log nguyên tử vào shared-tmpfs. Thiết kế container độc
+    lập cho phép tái sử dụng với bất kỳ ứng dụng mục tiêu nào mà không cần
+    sửa đổi.
+
+    \item \textbf{Cơ chế phát hiện Blind SSRF hai tầng không có false positive.}
+    \texttt{SSRFVulnCheck} kết hợp tín hiệu in-band (PHP hook qua UOPZ ghi
+    nhận lời gọi hàm mạng với OOB payload) và tín hiệu OOB (callback log
+    từ OOB server) theo logic AND. Chỉ khi cả hai bằng chứng cùng tồn tại
+    mới xác nhận lỗ hổng, đảm bảo zero false positive ngay trong môi trường
+    fuzzing song song.
+\end{enumerate}
+
+Ba đóng góp trên được tích hợp hoàn toàn theo mô hình plugin không xâm lấn
+vào Phuzz~\cite{neef2024phuzz}, giữ nguyên toàn bộ chức năng phát hiện lỗ
+hổng gốc, đồng thời mở rộng khả năng phát hiện lên lớp lỗ hổng Blind SSRF
+vốn nằm ngoài tầm quan sát của mọi greybox fuzzer hiện tại.
+
+% ============================================================
+\section{Cấu trúc Khóa luận}
+\label{sec:structure}
+% ============================================================
+
+Phần còn lại của khóa luận được tổ chức như sau:
+
+\textbf{Chương~2 --- Cơ sở Lý thuyết} trình bày nền tảng lý thuyết cần thiết: tổng
+quan chi tiết về kỹ thuật greybox fuzzing, energy-based seed scheduling và coverage
+guidance; kiến trúc và cơ chế hoạt động đầy đủ của framework Phuzz bao gồm cơ chế
+instrumentation và VulnChecker; cơ chế phân tích động, hook hàm PHP qua extension
+UOPZ; và nhận xét về bài toán cần giải quyết từ góc độ khoảng trống kỹ thuật.
+
+\textbf{Chương~3 --- Thiết kế và Cài đặt Hệ thống} mở đầu bằng phân tích toàn diện
+lỗ hổng SSRF (định nghĩa, phân loại, tác động, kỹ thuật bypass) và kỹ thuật OOB
+(cơ chế tương quan token, so sánh giao thức), tiếp theo là mô tả chi tiết kiến trúc
+bốn container Docker trên mạng phuzz-net 172.20.0.0/24; cài đặt hook PHP với 23 hook
+trên 5 nhóm hàm; OOB server (Flask + dnsmasq, ghi log nguyên tử); bộ đột biến SSRF
+với 21 biến thể và 10 biến thể command injection; cơ chế phát hiện hai tầng với AND
+logic; và cách các thành phần tích hợp vào vòng lặp fuzz chính theo mô hình plugin
+không xâm lấn.
+
+\textbf{Chương~4 --- Thực nghiệm và Đánh giá} trình bày môi trường thực nghiệm, thiết
+kế thực nghiệm trên 14 mục tiêu (6 ứng dụng lab và 8 CVE thực tế từ hệ sinh thái
+WordPress và PHP plugin), kết quả phát hiện chi tiết cho từng mục tiêu, phân tích các
+trường hợp đặc biệt (biến thể bypass scheme-less, sink getimagesize, stream wrapper
+cho include/require), và so sánh với Phuzz gốc chưa tích hợp OOB.
+
+\textbf{Chương~5 --- Kết luận và Hướng Phát triển} tổng kết các đóng góp chính của
+khóa luận, phân tích trung thực các hạn chế còn tồn tại (phạm vi ngôn ngữ PHP, stored
+SSRF, quy mô thực nghiệm, phụ thuộc kết nối mạng nội bộ), và đề xuất các hướng mở
+rộng tiềm năng (đa ngôn ngữ, stored SSRF qua deferred lookup, XXE/SQLi OOB, tự động
+tạo PoC, tích hợp CI/CD pipeline).

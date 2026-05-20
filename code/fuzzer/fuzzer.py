@@ -21,9 +21,11 @@ import traceback
 import requests
 import utils
 from candidate import Candidate
-from mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
+from mutator import DefaultMutator, EmptyQueueMutator, SingleMutator, SSRFOnlyMutator, CmdInjSSRFOnlyMutator
 from scoring import DefaultScoringFormula
 from vulncheck import DefaultVulnChecker, ParamBasedVulnChecker
+from ssrf_mutator import SSRFMutator
+from ssrf_vulncheck import SSRFVulnCheck
 from utils import fuzz_open
 
 #def print(*args, **kwargs):
@@ -82,12 +84,11 @@ class Fuzzer:
             "/shared-tmpfs/", "pathtraversal-error-reports")
         self.xxe_errors_folder = os.path.join(
             "/shared-tmpfs/", "xxe-error-reports")
-        self.output_dir = os.path.join("./output", f"fuzzer-{fuzzer_id}")
-        if os.path.exists(self.output_dir):
-            shutil.rmtree(self.output_dir)
-        os.mkdir(self.output_dir)
+        self.ssrf_errors_folder = os.path.join(
+            "/shared-tmpfs/", "ssrf-error-reports")
+        self.output_dir = None  # set in load_config() once config_path is known
 
-        ### 
+        ###
         # BEGIN Define Fuzzing modules
         ####
         self.scoring_formula = DefaultScoringFormula()
@@ -100,7 +101,8 @@ class Fuzzer:
             pathtraversal_errors_folder=self.pathtraversal_errors_folder,
             xxe_errors_folder=self.xxe_errors_folder,
             )
-        ### 
+        self.vulnchecker.vuln_checkers.append(SSRFVulnCheck(ssrf_errors_folder=self.ssrf_errors_folder))
+        ###
         # END Define Fuzzing modules
         ####
         os.umask(0)
@@ -125,7 +127,8 @@ class Fuzzer:
             'CommandInjection': self.shell_errors_folder,
             'Unserialize': self.unserialize_errors_folder,
             'PathTraversal': self.pathtraversal_errors_folder,
-            'XXE': self.xxe_errors_folder
+            'XXE': self.xxe_errors_folder,
+            'SSRF': self.ssrf_errors_folder
         }
 
         for k in self.vulnerable_candidates:
@@ -293,6 +296,12 @@ class Fuzzer:
         except Exception as e:
             print(e)
             sys.exit(f"Failed to parse fuzzer config: {config_path}")
+
+        # Output dir: ./output/<app>/<endpoint>/  e.g. ./output/ssrf-lab/curl/
+        self.output_dir = os.path.join("./output", config_path)
+        if os.path.exists(self.output_dir):
+            shutil.rmtree(self.output_dir, ignore_errors=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
         if not self.config["target"].startswith("http"):
             sys.exit(f"Target does not start with http!")
@@ -521,11 +530,16 @@ class Fuzzer:
 
     def ff_mutate(self, c):
 
-        mutator = SingleMutator()
+        if self.config.get('cmdi_ssrf_only'):
+            mutator = CmdInjSSRFOnlyMutator()
+        elif self.config.get('ssrf_only'):
+            mutator = SSRFOnlyMutator()
+        else:
+            mutator = SingleMutator()
 
         choice_keys = list(filter(lambda x: c.fuzz_params[x], c.fuzz_params))
         choice_weights = list(map(lambda x: c.fuzz_weights[x], choice_keys))
-        if not choice_keys or not choice_weights:
+        if not choice_keys or not choice_weights or sum(choice_weights) == 0:
             return None
         param_type = random.choices(choice_keys, weights=choice_weights)[0]
         param_name = random.choice(list(c.fuzz_params[param_type].keys()))
@@ -555,7 +569,7 @@ class Fuzzer:
             with requests.Session() as s:
                 #print(f'Testing candidate: {c.priority} {c.fuzz_params}')  
                 prepared_req = self.prepare_request(c)
-                response = s.send(prepared_req, timeout=self.request_timeout, allow_redirects=False)
+                response = s.send(prepared_req, timeout=self.request_timeout, allow_redirects=self.config.get('follow_redirects', False))
                 c.response = response
         except Exception as e:
             print(f"Exception encountered: {e}")

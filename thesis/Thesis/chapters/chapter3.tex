@@ -1,0 +1,1242 @@
+\chapter{Thiết kế và Cài đặt Hệ thống}
+
+Để phát hiện Blind SSRF, hệ thống cần giải quyết ba bài toán kỹ thuật độc
+lập nhưng liên kết chặt: biết \emph{ứng dụng đã gọi hàm mạng nào và với
+đối số gì} (tín hiệu in-band từ hook PHP), biết \emph{request đó có thực
+sự kết nối tới OOB server không} (tín hiệu ngoại tuyến từ server lắng
+nghe), và biết \emph{payload nào vượt qua được bộ lọc đầu vào của ứng
+dụng} (bộ đột biến đa biến thể). Ba bài toán này quy định trực tiếp toàn
+bộ kiến trúc được trình bày trong chương này.
+
+Chương mở đầu bằng nền tảng lý thuyết: Phần~\ref{sec:ssrf} phân tích lỗ
+hổng SSRF và lý do dạng Blind SSRF vô hình với mọi kênh tín hiệu truyền
+thống; Phần~\ref{sec:oob} giải thích kỹ thuật Out-of-Band và cơ chế tương
+quan token cho phép liên kết OOB callback về request gốc. Từ nền tảng đó,
+Phần~\ref{sec:arch} mô tả kiến trúc bốn container và cơ sở hạ tầng chia
+sẻ dữ liệu qua tmpfs. Các phần tiếp theo đi vào từng thành phần cài đặt:
+hook hàm PHP và stream wrapper (Phần~\ref{sec:hook-impl}), OOB server
+(Phần~\ref{sec:oob-impl}), bộ đột biến SSRF (Phần~\ref{sec:mutator-impl}),
+cơ chế phát hiện hai tầng (Phần~\ref{sec:feedback-impl}), và điểm tích
+hợp vào vòng lặp fuzz chính (Phần~\ref{sec:integration}).
+
+% ============================================================
+\section{Lỗ hổng Server-Side Request Forgery (SSRF)}
+\label{sec:ssrf}
+% ============================================================
+
+\subsection{Định nghĩa và Nguyên lý Hoạt động}
+
+Server-Side Request Forgery (SSRF) là lớp lỗ hổng bảo mật trong đó kẻ tấn
+công khiến máy chủ ứng dụng thực hiện các yêu cầu mạng tùy ý tới địa chỉ
+do attacker kiểm soát~\cite{owasp2021top10, owasp2023ssrf}. Lỗ hổng phát
+sinh khi ứng dụng nhận URL hoặc địa chỉ IP từ input người dùng và dùng trực
+tiếp nó để thực hiện network request phía server --- thường để fetch tài
+nguyên, gọi webhook, hay tích hợp dịch vụ bên ngoài.
+
+Trong PHP, SSRF thường xuất hiện khi input không được kiểm tra được truyền
+vào các hàm như \texttt{file\_get\_contents()}, \texttt{curl\_exec()},
+\texttt{wp\_remote\_get()}, \texttt{fsockopen()}, hay
+\texttt{stream\_socket\_client()}. Đoạn code điển hình:
+
+\begin{verbatim}
+// /fetch.php?url=<user_input>
+$url  = $_GET['url'];
+$data = file_get_contents($url);  // SSRF sink
+echo $data;
+\end{verbatim}
+
+Attacker có thể truyền \texttt{url=http://169.254.169.254/latest/meta-data/}
+để đọc AWS instance metadata, hoặc \texttt{url=http://redis:6379} để tương
+tác với Redis nội bộ vốn không được bảo vệ bởi tường lửa. Đây là ví dụ
+minh họa của cả hai hướng tấn công chính: leo thang privilege qua cloud
+metadata và di chuyển ngang (lateral movement) trong mạng nội bộ.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Sơ đồ nguyên lý SSRF — hai lớp mạng.
+    % Lớp ngoài (Internet): Attacker gửi HTTP GET /fetch.php?url=http://169.254.169.254/...
+    %   đến Web Server. Tường lửa ở giữa chặn truy cập trực tiếp từ Internet vào Internal Network.
+    % Lớp trong (Internal Network): Web Server (đã vào được bên trong) gọi
+    %   file_get_contents($url) → HTTP request → Cloud Metadata Service (169.254.169.254),
+    %   hoặc → Redis (:6379), hoặc → Admin Panel (/admin).
+    % Kết quả: Response nội bộ về Web Server → Web Server phản ánh về Attacker (Regular SSRF)
+    %   hoặc chỉ xử lý nội bộ (Blind SSRF).
+    % Điểm nhấn màu đỏ: tường lửa có lỗ hổng — chặn Internet→Internal nhưng không chặn
+    %   Web Server→Internal vì Web Server được coi là nội bộ.
+    \includegraphics[width=0.85\textwidth]{figures/fig-ssrf-principle}
+    \caption{Nguyên lý tấn công SSRF.}
+    \label{fig:ssrf-principle}
+\end{figure}
+
+\subsection{Phân loại SSRF}
+
+\textbf{Regular SSRF (In-band SSRF).} Response của network request phía server
+được phản ánh một phần hoặc toàn bộ trong HTTP response trả về cho attacker.
+Attacker có thể đọc trực tiếp nội dung tài nguyên nội bộ, khiến đây là dạng
+SSRF dễ phát hiện nhất do có tín hiệu rõ ràng trong response.
+
+\textbf{Blind SSRF (Out-of-band SSRF).} Máy chủ thực hiện network request
+nhưng response \emph{không được} phản ánh trong HTTP response trả về --- ứng
+dụng xử lý kết quả nội bộ, loại bỏ, hoặc chỉ ghi log. Từ góc độ bên ngoài,
+HTTP response trông hoàn toàn bình thường. Blind SSRF đặc biệt phổ biến trong
+các tình huống:
+\begin{itemize}
+    \item \textbf{Webhook validation}: Ứng dụng gọi URL để kiểm tra tính
+    hợp lệ nhưng không trả về nội dung. Ví dụ: nhiều plugin WordPress xác
+    nhận URL webhook bằng cách gửi request thử và kiểm tra status code.
+    \item \textbf{Background processing}: Request được đẩy vào hàng đợi
+    (queue) và xử lý bất đồng bộ bởi worker riêng, không liên quan đến HTTP
+    response của request gốc.
+    \item \textbf{License/telemetry checks}: Nhiều plugin thương mại gọi
+    server nhà sản xuất trong background để kiểm tra license hoặc gửi thống
+    kê ẩn danh, không hiển thị kết quả.
+\end{itemize}
+
+\textbf{Semi-blind SSRF.} Một số tài liệu phân loại thêm dạng trung gian:
+ứng dụng không phản ánh nội dung response nhưng có sự khác biệt quan sát
+được trong HTTP response (ví dụ: thời gian phản hồi khác nhau, status code
+khác nhau). Dạng này có thể phát hiện bằng kỹ thuật timing oracle nhưng khó
+tự động hóa do phụ thuộc vào nhiễu mạng.
+
+\subsection{Tác động và Mức độ Nghiêm trọng}
+
+SSRF được đưa vào OWASP Top 10:2021 tại vị trí A10:2021 --- Server-Side
+Request Forgery như một mục riêng biệt~\cite{owasp2021top10} --- đây là lần
+đầu tiên trong lịch sử OWASP Top 10 lỗ hổng này được ghi nhận, phản ánh
+tần suất và mức độ ảnh hưởng ngày càng tăng trong kiến trúc microservice và
+cloud. Tác động của SSRF bao gồm:
+
+\begin{itemize}
+    \item \textbf{Truy cập tài nguyên nội bộ}: Tiếp cận các dịch vụ như cơ
+    sở dữ liệu, Redis, Elasticsearch vốn không được tiếp xúc với Internet,
+    vượt qua chính sách tường lửa nhờ dùng máy chủ ứng dụng làm proxy.
+    \item \textbf{Đánh cắp credentials cloud}: Trong môi trường AWS, Azure,
+    GCP, attacker có thể lấy IAM credentials từ instance metadata service
+    (\texttt{169.254.169.254}), dẫn tới chiếm quyền toàn bộ cloud account.
+    Đây chính là vectơ tấn công được dùng trong sự cố Capital One 2019 gây
+    lộ lọt dữ liệu của 100 triệu khách hàng~\cite{owasp2021top10}.
+    \item \textbf{Port scanning mạng nội bộ}: Máy chủ bị lợi dụng để quét
+    và xác định các dịch vụ đang chạy trong mạng nội bộ, phục vụ cho các
+    bước tấn công tiếp theo.
+    \item \textbf{Leo thang lên RCE qua Gopher}: Kết hợp Gopher protocol với
+    Redis RESP injection, attacker gửi lệnh Redis tùy ý và khai thác cấu hình
+    Redis không có xác thực để ghi file tùy ý lên hệ thống, từ đó leo thang
+    thành Remote Code Execution.
+    \item \textbf{Đọc file cục bộ}: Khi ứng dụng dùng \texttt{file://} scheme,
+    SSRF có thể đọc file nhạy cảm như \texttt{/etc/passwd},
+    \texttt{/etc/shadow} hay mã nguồn ứng dụng.
+\end{itemize}
+
+\subsection{Phân tích Kỹ thuật Bypass Phổ biến}
+\label{subsec:ssrf-bypass}
+
+Nhiều ứng dụng cố gắng ngăn chặn SSRF bằng blocklist, từ chối các IP nội
+bộ như \texttt{127.0.0.1}, \texttt{10.0.0.0/8}, \texttt{192.168.0.0/16}.
+Tuy nhiên, blocklist thường không đầy đủ và có thể vượt qua bằng nhiều
+kỹ thuật~\cite{owasp2023ssrf}:
+
+\textbf{Biểu diễn IP thay thế.} Nhiều bộ phân tích URL chấp nhận các dạng
+biểu diễn địa chỉ IP khác nhau mà blocklist dựa trên chuỗi không bắt kịp:
+\begin{itemize}
+    \item Hex: \texttt{0x7f000001} = 127.0.0.1
+    \item Decimal: \texttt{2130706433} = 127.0.0.1
+    \item Octal: \texttt{0177.0.0.1} = 127.0.0.1
+    \item IPv6 mapped: \texttt{::ffff:127.0.0.1} hay \texttt{::ffff:7f00:1}
+    \item URL-encoded dot: \texttt{127.0.0\%2e1} hay \texttt{127.0.0\%252e1}
+    (double encoding)
+\end{itemize}
+
+\textbf{DNS rebinding.} Đây là kỹ thuật bypass tinh vi nhất, lợi dụng
+khoảng thời gian giữa hai lần DNS lookup:
+\begin{enumerate}
+    \item Attacker kiểm soát DNS server cho domain \texttt{evil.attacker.com}.
+    \item Lần DNS lookup đầu tiên (khi ứng dụng validate URL): DNS server trả
+    về địa chỉ IP public hợp lệ, vượt qua kiểm tra blocklist.
+    \item Attacker cấu hình DNS với TTL rất ngắn (1 giây).
+    \item Sau khi TTL hết hạn, lần DNS lookup thứ hai (khi ứng dụng thực sự
+    kết nối): DNS server trả về địa chỉ IP nội bộ như \texttt{192.168.1.1}.
+    \item Ứng dụng kết nối tới địa chỉ nội bộ mà không kiểm tra lại.
+\end{enumerate}
+Kỹ thuật này đặc biệt nguy hiểm vì nó qua được cả các cơ chế bảo vệ
+``check-then-use'' được thiết kế cẩn thận.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Timeline DNS Rebinding Attack (trục thời gian nằm ngang).
+    % T=0 (Lần DNS lookup 1 — Validation):
+    %   App kiểm tra: attacker.com → DNS Server của Attacker → 1.2.3.4 (public IP).
+    %   Kết quả: IP 1.2.3.4 không nằm trong blocklist → PASS.
+    %   DNS TTL = 1 giây.
+    % T=1s (TTL hết hạn): cache DNS bị xóa.
+    % T=2 (Lần DNS lookup 2 — Connection):
+    %   App kết nối: attacker.com → DNS Server của Attacker → 192.168.1.1 (internal IP).
+    %   Kết quả: App kết nối thực sự tới 192.168.1.1 trong mạng nội bộ.
+    % Phần dưới: so sánh hai dòng — "Validation" vs "Connection" — để thấy IP thay đổi.
+    \includegraphics[width=0.80\textwidth]{figures/fig-dns-rebinding}
+    \caption{Kỹ thuật DNS Rebinding.}
+    \label{fig:dns-rebinding}
+\end{figure}
+
+\textbf{Redirect qua domain tin cậy.} Nếu ứng dụng có open redirect trên
+một domain được whitelist, attacker có thể dùng redirect đó để chuyển hướng
+request tới địa chỉ nội bộ. Ví dụ: \texttt{http://trusted.com/redirect?url=
+http://192.168.1.1}.
+
+\textbf{URL parsing inconsistency.} Userinfo trong URL (\texttt{http://
+user@host:port/path}) có thể gây nhầm lẫn giữa các parser khác nhau:
+\texttt{http://trusted.com@192.168.1.1/} --- một số parser coi
+\texttt{trusted.com} là hostname, parser khác coi đây là userinfo và
+\texttt{192.168.1.1} mới là hostname thực sự.
+
+\textbf{Scheme thay thế.} Ngoài \texttt{http://} và \texttt{https://}, PHP
+hỗ trợ nhiều URL scheme khác có thể khai thác SSRF:
+\begin{itemize}
+    \item \texttt{file://}: Đọc file cục bộ.
+    \item \texttt{gopher://}: Gửi dữ liệu TCP tùy ý, dùng để tương tác với
+    Redis, Memcached, SMTP.
+    \item \texttt{dict://}: Truy vấn từ điển qua TCP, có thể dùng để port
+    scan.
+    \item \texttt{ftp://}: Kết nối FTP, có thể rò rỉ địa chỉ IP nội bộ.
+\end{itemize}
+
+\subsection{SSRF trong Hệ sinh thái PHP}
+\label{subsec:ssrf-php}
+
+PHP có những đặc điểm ngôn ngữ khiến SSRF đặc biệt phổ biến trong hệ sinh
+thái này~\cite{phpgroup2023history}.
+
+\textbf{Stream wrappers.} PHP triển khai một hệ thống \emph{stream wrapper}
+cho phép nhiều giao thức khác nhau được truy cập qua cùng một API file I/O.
+Khi \texttt{file\_get\_contents(\$url)} được gọi, PHP tự động chọn wrapper
+phù hợp dựa trên scheme của URL: \texttt{http://} dùng HTTP wrapper,
+\texttt{ftp://} dùng FTP wrapper, \texttt{file://} dùng file wrapper,
+\texttt{php://} dùng built-in PHP stream. Điều này có nghĩa là mọi hàm I/O
+của PHP --- không chỉ các hàm cURL chuyên dụng --- đều tiềm ẩn nguy cơ SSRF
+khi nhận input không được kiểm tra.
+
+\textbf{WordPress HTTP API.} WordPress cung cấp \texttt{wp\_remote\_get()},
+\texttt{wp\_remote\_post()}, \texttt{wp\_remote\_request()} như một abstraction
+layer trên cURL. Hàng nghìn plugin WordPress dùng các hàm này để tích hợp
+dịch vụ bên ngoài; nếu tham số URL có thể bị kiểm soát bởi input người dùng
+(dù gián tiếp), SSRF có thể xảy ra. Do nằm ở tầng framework cao, các hàm
+này thường bị bỏ sót trong các công cụ SSRF analysis vốn chỉ hook tầng
+cURL/PHP gốc.
+
+\textbf{Non-obvious sinks.} Ngoài các hàm HTTP rõ ràng, nhiều hàm PHP ít được
+chú ý cũng thực hiện network request ngầm khi nhận URL:
+\texttt{getimagesize(\$url)}, \texttt{exif\_read\_data(\$url)},
+\texttt{get\_headers(\$url)}, \texttt{SimpleXML::load(\$url)},
+\texttt{DOMDocument::load(\$url)}, \texttt{SoapClient::\_\_construct()} (WSDL
+endpoint). Ví dụ: nhiều ứng dụng cho phép người dùng nhập URL ảnh đại diện,
+rồi gọi \texttt{getimagesize(\$url)} để kiểm tra kích thước ảnh trước khi
+tải về --- đây là SSRF sink không hiển nhiên.
+
+\subsection{Thách thức Phát hiện Blind SSRF trong Fuzzing Tự động}
+
+Blind SSRF đặt ra thách thức cơ bản cho mọi công cụ fuzzing, bao gồm cả
+greybox fuzzer như Phuzz:
+
+\begin{enumerate}
+    \item \textbf{HTTP response không có tín hiệu}: Response trả về bình
+    thường --- không có exception, không có thay đổi status code, không có
+    nội dung bất thường. Mọi VulnChecker dựa trên phân tích response đều
+    không phát hiện được gì.
+    \item \textbf{Coverage không phân biệt được}: Khi
+    \texttt{file\_get\_contents(\$url)} được gọi với URL hợp lệ hay URL SSRF,
+    code path thực thi là hoàn toàn như nhau --- fuzzer không có cơ sở từ
+    độ phủ mã để nhận biết một network request bất thường đã xảy ra.
+    \item \textbf{Hành vi bất đồng bộ}: Request SSRF có thể được đẩy vào
+    background job (queue worker, cron job), tức kết quả không xuất hiện
+    trong response của request gốc mà xảy ra sau đó nhiều giây hoặc nhiều
+    phút.
+    \item \textbf{Bằng chứng chỉ có ở kênh ngoài}: Dấu hiệu duy nhất của
+    Blind SSRF là việc một máy chủ ngoài \emph{nhận được kết nối} từ máy
+    chủ ứng dụng --- thông tin này không bao giờ nằm trong luồng HTTP thông
+    thường giữa fuzzer và ứng dụng.
+\end{enumerate}
+
+Những hạn chế này dẫn đến kết luận: cần một kênh tín hiệu \emph{ngoài băng}
+(out-of-band) độc lập để phát hiện Blind SSRF một cách đáng tin cậy.
+Phần~\ref{sec:oob} trình bày kỹ thuật giải quyết vấn đề này.
+
+% ============================================================
+\section{Kỹ thuật Out-of-Band (OOB)}
+\label{sec:oob}
+% ============================================================
+
+\subsection{Khái niệm và Bối cảnh}
+
+Tương tác Out-of-Band (OOB) là kỹ thuật mà trong đó ứng dụng bị kiểm thử
+được kích hoạt để \emph{chủ động liên lạc} tới một máy chủ lắng nghe
+(\emph{OOB server} hay \emph{interaction server}) do kiểm thử viên kiểm soát,
+qua một kênh mạng hoàn toàn độc lập với kênh HTTP chính đang kiểm thử. Thay
+vì chờ ứng dụng trả về dấu hiệu lỗi, kỹ thuật OOB lắng nghe các kết nối
+\emph{đến từ} ứng dụng mục tiêu.
+
+Kỹ thuật này được sử dụng rộng rãi trong kiểm thử thủ công, điển hình là
+Burp Suite Collaborator~\cite{portswigger2023burp}: một dịch vụ cloud cung
+cấp các subdomain và địa chỉ IP dùng một lần để phát hiện blind interaction.
+Burp Collaborator giải quyết ba lớp OOB: DNS (domain lookup), HTTP (HTTP
+request), và SMTP (email). Khi payload gây ra bất kỳ tương tác nào với server
+Collaborator, Burp Suite ghi nhận và báo cáo.
+
+Trong lĩnh vực nghiên cứu bảo mật, kỹ thuật OOB đã được ứng dụng để phát
+hiện nhiều lớp lỗ hổng ``blind'' khác nhau:
+\begin{itemize}
+    \item \textbf{Blind SSRF}: Phát hiện qua HTTP/DNS callback từ server.
+    \item \textbf{Blind XXE}: Entity trong XML file trỏ về OOB server; khi
+    XML parser resolve external entity, callback được ghi nhận.
+    \item \textbf{Blind SQLi}: Một số database hỗ trợ DNS lookup trong query
+    (MySQL \texttt{LOAD\_FILE}, MSSQL \texttt{xp\_dirtree}) để exfiltrate
+    dữ liệu qua DNS.
+    \item \textbf{Log4Shell (CVE-2021-44228)}: JNDI lookup \texttt{\$\{jndi:
+    ldap://oob-server/\}} trong Java logging framework; OOB server nhận
+    LDAP/DNS request xác nhận code path bị ảnh hưởng.
+\end{itemize}
+
+\subsection{Cơ chế Token-Based Correlation}
+\label{subsec:oob-token}
+
+Thách thức cốt lõi khi dùng OOB trong fuzzing tự động là \emph{tương quan
+nhân quả} (causal correlation): khi OOB server nhận một kết nối, phải xác
+định chính xác đó là callback từ request fuzz nào trong số hàng nghìn request
+đang gửi song song. Cơ chế giải quyết là token-based correlation:
+
+\begin{enumerate}
+    \item Fuzzer sinh một \emph{token} ngẫu nhiên (chuỗi alphanumeric 8 ký
+    tự) duy nhất cho mỗi lần đột biến, lưu vào bảng \texttt{token\_map}.
+    \item Token được nhúng vào payload SSRF dưới dạng URL path hoặc subdomain:
+    \texttt{http://<oob-server>/<token>} hoặc
+    \texttt{http://<token>.<oob-domain>/}.
+    \item Khi ứng dụng mục tiêu thực hiện HTTP/DNS request tới địa chỉ trên,
+    OOB server ghi nhận callback cùng với token và thời gian.
+    \item Fuzzer tra cứu \texttt{token\_map}: nếu tìm thấy log callback khớp
+    token của ứng viên, ứng viên đó được xác nhận là SSRF.
+\end{enumerate}
+
+Cơ chế này đảm bảo \emph{zero false positive}: một ứng viên chỉ được báo cáo
+là SSRF khi có bằng chứng mạng thực tế (kết nối vật lý đến OOB server),
+không phụ thuộc vào heuristic hay pattern matching trên response.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Sequence diagram cơ chế OOB token-based correlation (5 thực thể theo chiều dọc).
+    % Các thực thể (cột từ trái qua phải):
+    %   Fuzzer | phuzz-web (PHP) | phuzz-oob (OOB Server) | shared-tmpfs | SSRFVulnCheck
+    % Luồng thông điệp (mũi tên ngang):
+    %   1. Fuzzer → Fuzzer: sinh token "ab12cd34", lưu token_map[token]=timestamp.
+    %   2. Fuzzer → phuzz-web: HTTP POST url="http://172.20.0.10:8000/ab12cd34"
+    %                           [X-Fuzzer-Covid: req-001].
+    %   3. phuzz-web → phuzz-web: PHP hook kích hoạt, ghi ssrf-hooks/req-001.json.
+    %   4. phuzz-web → phuzz-oob: HTTP GET /ab12cd34 (PHP thực sự gọi file_get_contents).
+    %   5. phuzz-oob → shared-tmpfs: ghi oob-logs/ab12cd34.json.
+    %   6. phuzz-web → Fuzzer: HTTP 200 OK (response bình thường).
+    %   7. Fuzzer → SSRFVulnCheck: check(candidate req-001).
+    %   8. SSRFVulnCheck → shared-tmpfs: đọc ssrf-hooks/req-001.json → token="ab12cd34".
+    %   9. SSRFVulnCheck → shared-tmpfs: đọc oob-logs/ab12cd34.json → tồn tại!
+    %   10. SSRFVulnCheck → Fuzzer: return True (SSRF xác nhận).
+    \includegraphics[width=0.92\textwidth]{figures/fig-oob-token-flow}
+    \caption{Cơ chế tương quan token trong phát hiện Blind SSRF.}
+    \label{fig:oob-token-flow}
+\end{figure}
+
+\subsection{So sánh Các Giao thức OOB}
+\label{subsec:oob-protocols}
+
+Có ba giao thức chính thường dùng cho OOB interaction, mỗi giao thức có
+đặc điểm về triển khai, khả năng vượt egress filter, và phù hợp với loại
+lỗ hổng khác nhau:
+
+\begin{table}[h]
+\centering
+\caption{So sánh các giao thức OOB interaction}
+\label{tab:oob-protocols}
+\begin{tabular}{|l|p{3.2cm}|p{3.2cm}|p{3.2cm}|}
+\hline
+\textbf{Tiêu chí}
+    & \textbf{DNS OOB}
+    & \textbf{HTTP OOB}
+    & \textbf{SMTP OOB} \\
+\hline
+Vượt egress filter
+    & Tốt nhất (port 53 UDP thường mở)
+    & Tốt (port 80/443)
+    & Kém (port 25 thường bị chặn)  \\
+\hline
+Hạ tầng
+    & Phức tạp (cần wildcard DNS authority)
+    & Đơn giản (HTTP server + dnsmasq)
+    & Phức tạp (SMTP server)  \\
+\hline
+Token trong payload
+    & Subdomain: \texttt{<tok>.oob.}
+    & URL path: \texttt{/<tok>}
+    & Header/body  \\
+\hline
+Metadata ghi được
+    & Ít (IP, timestamp)
+    & Nhiều (IP, method, headers, path, body)
+    & Vừa  \\
+\hline
+Phù hợp với
+    & Mọi lớp lỗ hổng blind
+    & SSRF, XXE, blind RCE
+    & Phishing, account takeover  \\
+\hline
+Phù hợp tích hợp tự động
+    & Trung bình
+    & Tốt nhất
+    & Kém  \\
+\hline
+\end{tabular}
+\end{table}
+
+Với bối cảnh tích hợp vào fuzzing tự động trong môi trường Docker, HTTP OOB
+là lựa chọn phù hợp nhất: dễ triển khai, ghi log chi tiết, token nằm trong
+URL path giúp tương quan dễ dàng, và các container giao tiếp nhau qua mạng
+bridge mà không cần đi ra Internet. Hệ thống đề xuất trong khóa luận này bổ
+sung thêm DNS OOB (qua dnsmasq wildcard) để tăng khả năng bypass egress
+filter trong các môi trường chặt chẽ hơn.
+
+\subsection{OOB như Kênh Phản hồi Bổ sung trong Fuzzing}
+
+Trong kiến trúc fuzzing, kênh OOB đóng vai trò là \emph{kênh phản hồi thứ
+ba}, song song và bổ sung cho hai kênh truyền thống:
+
+\begin{itemize}
+    \item \textbf{Kênh HTTP response}: Phân tích status code, headers, body
+    để phát hiện lỗ hổng có dấu hiệu trong response (XSS, SQLi lỗi cú pháp,
+    path traversal trả về nội dung file).
+    \item \textbf{Kênh coverage}: Theo dõi code path được thực thi để điều
+    hướng fuzzer khám phá code mới; không phân biệt được loại hành vi bên
+    trong code path.
+    \item \textbf{Kênh OOB}: Ghi nhận network callback từ ứng dụng, cho phép
+    phát hiện các hành vi mạng mà hai kênh trên không thể quan sát.
+\end{itemize}
+
+Điểm mấu chốt là kênh OOB hoàn toàn \emph{độc lập} với ứng dụng mục tiêu
+--- nó không yêu cầu thay đổi ứng dụng, không phụ thuộc vào error handling
+của ứng dụng, và hoạt động ngay cả khi ứng dụng cố tình che giấu lỗi hoặc
+xử lý request SSRF trong background.
+
+\subsection{Xử lý Tính Bất đồng bộ}
+\label{subsec:oob-async}
+
+Một thách thức quan trọng trong tích hợp OOB vào fuzzing là tính bất đồng bộ
+của callback: khi fuzzer nhận HTTP response từ ứng dụng, ứng dụng có thể đã
+thực hiện OOB call đồng bộ trong request handler, hoặc đẩy call vào background
+job và xử lý sau.
+
+Để không bỏ sót trường hợp thứ hai, hệ thống trong khóa luận này áp dụng
+chiến lược hai giai đoạn:
+\begin{enumerate}
+    \item \textbf{Kiểm tra tức thì}: Sau khi nhận HTTP response, tra cứu
+    OOB log ngay lập tức để bắt các callback đồng bộ.
+    \item \textbf{Token map với TTL}: Token không bị xóa ngay sau kiểm tra;
+    chúng được giữ lại trong \texttt{token\_map} trong suốt phiên fuzz. OOB
+    log có thể được quét lại theo định kỳ để bắt callback trễ từ background
+    job.
+\end{enumerate}
+
+Chiến lược này đảm bảo cả Blind SSRF đồng bộ và bất đồng bộ đều được phát
+hiện mà không đưa ra false positive.
+
+% ============================================================
+\section{Kiến trúc Tổng quan}
+\label{sec:arch}
+% ============================================================
+
+\subsection{Môi trường Triển khai}
+
+Toàn bộ hệ thống được đóng gói trong môi trường Docker~\cite{docker2023}
+và khởi chạy bằng một file \texttt{docker-compose.ssrf.yml} duy nhất. Môi
+trường gồm bốn container:
+
+\begin{itemize}
+    \item \textbf{phuzz-oob} --- Máy chủ OOB; chạy hai tiến trình song song
+    qua \texttt{supervisord}: dnsmasq (phân giải DNS) và Flask HTTP listener.
+    Container được gán địa chỉ IP tĩnh \texttt{172.20.0.10} trong mạng nội bộ.
+    \item \textbf{phuzz-db} --- Cơ sở dữ liệu MySQL 8 dùng chung cho ứng dụng
+    mục tiêu.
+    \item \textbf{phuzz-web} --- Container PHP/Apache chứa ứng dụng mục tiêu
+    được instrument; dùng \texttt{phuzz-oob} làm DNS server.
+    \item \textbf{phuzz-fuzzer} --- Container fuzzer; chạy script
+    \texttt{fuzzer.py} với \texttt{SSRFMutator} và \texttt{SSRFVulnCheck} được
+    tích hợp.
+\end{itemize}
+
+\subsection{Mạng Docker}
+
+Cả bốn container chia sẻ một Docker bridge network tên \texttt{phuzz-net}
+với subnet cố định \texttt{172.20.0.0/24}. Việc cố định subnet là điều kiện
+bắt buộc để hai cơ chế sau hoạt động:
+
+\begin{enumerate}
+    \item \textbf{IP tĩnh OOB server}: \texttt{phuzz-oob} phải có IP cố định
+    \texttt{172.20.0.10} để các payload IP-based trong
+    \texttt{SSRFMutator} luôn trỏ đúng địa chỉ, kể cả các biến thể
+    mã hóa (decimal \texttt{2886795274}, hex \texttt{0xac14000a}, octal
+    \texttt{0254.024.0.012}).
+    \item \textbf{DNS *.oob}: \texttt{phuzz-web} được cấu hình
+    \texttt{dns: [172.20.0.10]} để sử dụng \texttt{phuzz-oob} làm nameserver.
+    dnsmasq trên \texttt{phuzz-oob} trả lời mọi truy vấn \texttt{*.oob} về
+    \texttt{172.20.0.10}, cho phép payload dạng
+    \texttt{http://<token>.oob:8000/} được phân giải đúng.
+\end{enumerate}
+
+\subsection{Shared Volume và Luồng Dữ liệu}
+
+Hai Docker volume kiểu tmpfs làm kênh giao tiếp giữa các container:
+
+\begin{itemize}
+    \item \textbf{shared-tmpfs} (512 MB) được mount vào cả ba container
+    \texttt{phuzz-oob}, \texttt{phuzz-web}, \texttt{phuzz-fuzzer}.
+    Bảng~\ref{tab:tmpfs} liệt kê các thư mục con.
+    \item \textbf{sync-tmpfs} (256 MB) dùng để đồng bộ tập ứng viên giữa
+    nhiều instance fuzzer chạy song song.
+\end{itemize}
+
+\begin{table}[h]{Cấu trúc thư mục trên \texttt{shared-tmpfs}}
+\label{tab:tmpfs}
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Thư mục} & \textbf{Người ghi} & \textbf{Người đọc} \\
+\hline
+\texttt{coverage-reports/}    & phuzz-web (PHP)      & phuzz-fuzzer \\
+\texttt{ssrf-hooks/}          & phuzz-web (PHP hook) & phuzz-fuzzer \\
+\texttt{oob-logs/}            & phuzz-oob (Flask)    & phuzz-fuzzer \\
+\texttt{ssrf-error-reports/}  & phuzz-fuzzer         & phuzz-fuzzer \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Sơ đồ kiến trúc 4-container Docker của hệ thống đề xuất.
+    % Hình chữ nhật lớn bên ngoài: Docker network "phuzz-net" (172.20.0.0/24).
+    % Bên trong: 4 container dạng hộp màu khác nhau:
+    %   - phuzz-fuzzer (172.20.0.x): "Fuzzer (Python)" — SSRFMutator, SSRFVulnCheck,
+    %     vòng lặp fuzz chính. Nối với phuzz-web qua HTTP.
+    %   - phuzz-web (172.20.0.y): "Web Container (PHP 8.x + Apache)" — ứng dụng
+    %     mục tiêu, 08_ssrf.php hook, PCOV/Xdebug coverage. Nối phuzz-db qua MySQL.
+    %   - phuzz-oob (172.20.0.10): "OOB Server" — Flask HTTP:8000 + HTTPS:8443,
+    %     dnsmasq (*.oob → 172.20.0.10). Viền màu đỏ/cam để nổi bật.
+    %   - phuzz-db (172.20.0.z): "MySQL 8".
+    % Kết nối:
+    %   fuzzer ↔ web: HTTP request / X-Fuzzer-Covid header.
+    %   web → oob: OOB callback (khi ứng dụng gọi file_get_contents(SSRF_URL)).
+    %   web → db: SQL queries.
+    % Hình trụ "shared-tmpfs (512 MB)" nối fuzzer ↔ web ↔ oob (3 container đọc/ghi).
+    % Hình trụ "sync-tmpfs (256 MB)" nối các fuzzer instance song song.
+    \includegraphics[width=0.90\textwidth]{figures/fig-system-arch}
+    \caption{Kiến trúc tổng quan hệ thống đề xuất.}
+    \label{fig:system-arch}
+\end{figure}
+
+\subsection{Thứ tự Khởi động}
+
+\texttt{phuzz-oob} và \texttt{phuzz-db} khởi động trước; \texttt{phuzz-web}
+chỉ được coi là \textit{healthy} khi file \texttt{/shared-tmpfs/web-paths.txt}
+tồn tại (script \texttt{entrypoint.sh} chạy \texttt{find /var/www/html} và
+ghi ra file này sau khi hoàn tất rsync ứng dụng). \texttt{phuzz-fuzzer} đợi
+\texttt{phuzz-web} qua \texttt{condition: service\_healthy} trước khi bắt đầu
+vòng lặp fuzz.
+
+% ============================================================
+\section{Hook Hàm PHP}
+\label{sec:hook-impl}
+% ============================================================
+
+\subsection{Cơ chế Tải Hook}
+
+Hook được đặt trong file \texttt{08\_ssrf.php} thuộc thư mục
+\texttt{instrumentation/overrides.d/} và được load tự động qua cơ chế
+\texttt{auto\_prepend\_file} của PHP. Nhờ đó, \texttt{08\_ssrf.php} được
+thực thi trước bất kỳ code ứng dụng nào, đảm bảo hook luôn sẵn sàng từ
+đầu mỗi request. Cơ chế \texttt{auto\_prepend\_file} này là thành phần
+instrumentation sẵn có của Phuzz~\cite{neef2024phuzz} --- khóa luận chỉ
+thêm file hook SSRF vào thư mục \texttt{overrides.d/} mà không cần sửa
+đổi hạ tầng instrumentation gốc.
+
+Hằng số \texttt{\_\_FUZZER\_\_COVID} (được inject bởi instrumentation
+framework Phuzz từ header \texttt{X-Fuzzer-Covid}) được dùng làm tên file
+log, đảm bảo mỗi hook log khớp chính xác với request mà fuzzer đã gửi.
+
+\subsection{Nhận diện OOB Payload}
+
+Hàm \texttt{\_\_fuzzer\_\_ssrf\_is\_oob()} kiểm tra xem đối số truyền vào
+một hàm mạng có chứa định danh OOB hay không. Hàm này được thiết kế để bao
+phủ toàn bộ 21 biến thể payload của \texttt{SSRFMutator} (xem
+Phần~\ref{sec:mutator-impl}):
+
+\begin{verbatim}
+function __fuzzer__ssrf_is_oob(string $value): bool {
+    static $needles = null;
+    if ($needles === null) {
+        $needles = [
+            '172.20.0.10',   // plain IP (và trailing-dot, userinfo, fragment)
+            '2886795274',    // decimal IP
+            '0xac14000a',    // hex IP
+            '0254.024.0.012',// octal IP
+            '::ffff:ac14',   // IPv6 mapped hex
+            '.oob:',         // DNS *.oob (http://<token>.oob:8000)
+            '.oob/',         // DNS *.oob (path)
+            '.nip.io',       // nip.io bypass
+            '.sslip.io',     // sslip.io bypass
+            'oob.phuzz',     // hostname bypass (extra_hosts)
+        ];
+    }
+    $lower = strtolower($value);
+    foreach ($needles as $needle) {
+        if (strpos($lower, $needle) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+\end{verbatim}
+
+Việc dùng \texttt{strpos} với \texttt{strtolower} đảm bảo cả biến thể
+\texttt{HTTP://} (mixed-case scheme, variant 10) cũng được nhận diện chính
+xác.
+
+\subsection{Ghi Log SSRF Hook}
+
+Khi \texttt{\_\_fuzzer\_\_ssrf\_is\_oob()} trả về \texttt{true}, hàm
+\texttt{\_\_fuzzer\_\_ssrf\_log()} ghi một JSON entry vào thư mục
+\texttt{/shared-tmpfs/ssrf-hooks/}:
+
+\begin{verbatim}
+function __fuzzer__ssrf_log(string $function, string $argument): void {
+    $path = __FUZZER__SSRF_HOOKS_PATH . __FUZZER__COVID . '.json';
+    if (file_exists($path)) { return; }  // first-write-wins
+    $entry = json_encode([
+        'function'  => $function,
+        'argument'  => $argument,
+        'timestamp' => time(),
+    ]);
+    file_put_contents($path, $entry);
+    chmod($path, 0777);
+}
+\end{verbatim}
+
+Chiến lược \textit{first-write-wins} (kiểm tra \texttt{file\_exists} trước
+khi ghi) đảm bảo chỉ lần kích hoạt đầu tiên trong một request được ghi lại,
+tránh ghi đè bởi các lần gọi hàm tiếp theo trong cùng request.
+
+\subsection{Danh sách Hook}
+
+Hệ thống cài đặt tổng cộng 23 hook qua
+\texttt{uopz\_set\_hook}~\cite{phpgroup2023uopz} trên năm nhóm hàm,
+tổng hợp trong Bảng~\ref{tab:php-hooks}.
+
+\begin{table}[h]{Danh sách hook PHP theo nhóm chức năng}
+\label{tab:php-hooks}
+\centering
+\small
+\begin{tabular}{|l|l|p{4.2cm}|}
+\hline
+\textbf{Hàm PHP} & \textbf{Đối số kiểm tra} & \textbf{Ghi chú} \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm Network/HTTP (7 hàm)}} \\
+\hline
+\texttt{file\_get\_contents}  & \texttt{\$filename}  & Sink phổ biến nhất \\
+\texttt{fopen}                & \texttt{\$filename}  & \\
+\texttt{readfile}             & \texttt{\$filename}  & \\
+\texttt{file}                 & \texttt{\$filename}  & \\
+\texttt{get\_headers}         & \texttt{\$url}       & \\
+\texttt{get\_meta\_tags}      & \texttt{\$url}       & \\
+\texttt{getimagesize}         & \texttt{\$filename}  & Sink ẩn (image fetch) \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm cURL (3 hàm)}} \\
+\hline
+\texttt{curl\_exec}           & \texttt{curl\_getinfo(\$ch)['url']} & Đọc URL từ handle \\
+\texttt{curl\_setopt}         & \texttt{\$value} khi \texttt{\$option=CURLOPT\_URL} & Bắt khi setopt \\
+\texttt{curl\_multi\_exec}    & (qua \texttt{curl\_setopt})          & Hook phụ \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm Sockets (3 hàm)}} \\
+\hline
+\texttt{fsockopen}            & \texttt{\$hostname}  & \\
+\texttt{pfsockopen}           & \texttt{\$hostname}  & \\
+\texttt{stream\_socket\_client} & \texttt{\$address} & \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm Shell Execution (5 hàm) — CmdInj → SSRF}} \\
+\hline
+\texttt{shell\_exec}          & \texttt{\$cmd}       & \\
+\texttt{system}               & \texttt{\$cmd}       & \\
+\texttt{exec}                 & \texttt{\$cmd}       & \\
+\texttt{passthru}             & \texttt{\$cmd}       & \\
+\texttt{popen}                & \texttt{\$cmd}       & \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm WordPress Wrappers (5 hàm) — chỉ đăng ký khi WP được phát hiện}} \\
+\hline
+\texttt{wp\_remote\_get}       & \texttt{\$url}      & \\
+\texttt{wp\_remote\_post}      & \texttt{\$url}      & \\
+\texttt{wp\_remote\_request}   & \texttt{\$url}      & \\
+\texttt{wp\_safe\_remote\_get} & \texttt{\$url}      & \\
+\texttt{wp\_safe\_remote\_post}& \texttt{\$url}      & \\
+\hline
+\end{tabular}
+\end{table}
+
+Nhóm Shell Execution bao phủ kịch bản \texttt{CmdInjectionSSRFMutator}
+chèn lệnh \texttt{curl}/\texttt{wget} vào đối số shell. Nhóm WordPress
+chỉ được đăng ký khi \texttt{function\_exists('wp\_remote\_get')} trả về
+\texttt{true}, tránh lỗi runtime trên môi trường PHP standalone.
+
+\subsection{WordPress mu-plugin Bypass}
+
+WordPress có cơ chế \texttt{WP\_HTTP::block\_request()} chặn mọi HTTP request
+tới địa chỉ IP nội bộ theo RFC 1918 nhằm ngăn chặn SSRF. Trong môi trường
+fuzzing, cơ chế này lại cản trở việc kiểm thử: nếu \texttt{wp\_remote\_get}
+bị chặn trước khi thực thi, hook UOPZ sẽ không được kích hoạt và OOB server
+sẽ không nhận được callback.
+
+Để giải quyết, \texttt{entrypoint.sh} tự động cài đặt một
+\textit{must-use plugin} (mu-plugin) vào thư mục
+\texttt{wp-content/mu-plugins/} khi phát hiện môi trường WordPress:
+
+\begin{verbatim}
+<?php
+// Fuzzer: allow WP_HTTP requests to private/internal IPs for SSRF detection
+add_filter("http_request_host_is_external", "__return_true");
+\end{verbatim}
+
+Filter \texttt{http\_request\_host\_is\_external} trả về \texttt{true} vô
+điều kiện, vô hiệu hóa \texttt{block\_request()} và cho phép
+\texttt{wp\_remote\_get} thực sự gọi tới OOB server.
+
+\subsection{PHP Stream Wrapper --- Phát hiện qua \texttt{include}/\texttt{require}}
+\label{subsec:stream-wrapper}
+
+\texttt{uopz\_set\_hook} hoạt động ở tầng hàm: cơ chế này chặn bắt lời
+gọi tới các hàm PHP được khai báo trong bảng hàm (\textit{function table})
+như \texttt{file\_get\_contents} hay \texttt{curl\_exec}. Cấu trúc ngôn
+ngữ (\textit{language construct}) như \texttt{include} và
+\texttt{require\_once} là thành phần cú pháp được tích hợp trực tiếp vào
+Zend Engine, không tồn tại dưới dạng mục trong bảng hàm --- do đó UOPZ
+không thể áp dụng hook cho chúng.
+
+PHP cung cấp một cơ chế riêng để chặn bắt truy cập URL: \textit{stream
+wrapper}. Khi PHP cần mở một URL (kể cả từ
+\texttt{include("http://...")}), runtime tra cứu wrapper đã đăng ký cho
+scheme tương ứng và gọi phương thức \texttt{stream\_open()} của lớp
+wrapper đó. File \texttt{09\_ssrf\_stream.php} tận dụng cơ chế này bằng
+cách đăng ký lớp \texttt{\_\_FuzzerSSRFStreamWrapper} thay thế wrapper
+tích hợp sẵn cho cả hai scheme \texttt{http} và \texttt{https}:
+
+\begin{verbatim}
+foreach (['http', 'https'] as $scheme) {
+    if (in_array($scheme, stream_get_wrappers())) {
+        stream_wrapper_unregister($scheme);
+        stream_wrapper_register($scheme, '__FuzzerSSRFStreamWrapper');
+    }
+}
+\end{verbatim}
+
+Khi \texttt{stream\_open()} được kích hoạt, wrapper kiểm tra URL bằng
+hàm \texttt{\_\_fuzzer\_\_ssrf\_is\_oob()}, ghi nhận sự kiện nếu phát
+hiện payload OOB, rồi thực hiện chuỗi thao tác \textit{khôi phục →
+mở → đăng ký lại} để chuyển tiếp yêu cầu cho wrapper gốc xử lý, tránh
+đệ quy vô hạn:
+
+\begin{verbatim}
+stream_wrapper_restore($scheme);    // tạm thời khôi phục wrapper gốc
+$this->fp = @fopen($path, $mode);   // wrapper gốc thực hiện yêu cầu thực sự
+stream_wrapper_unregister($scheme);
+stream_wrapper_register($scheme, '__FuzzerSSRFStreamWrapper'); // đăng ký lại
+\end{verbatim}
+
+Cơ chế stream wrapper bổ sung khả năng phát hiện cho các trường hợp
+Remote File Inclusion (RFI) mà hook UOPZ không xử lý được --- điển hình
+là bWAPP với cấu trúc \texttt{include(\$language)} và Mutillidae với
+\texttt{require\_once(\$page)}, trong đó URL do người dùng cung cấp được
+nạp trực tiếp thông qua cấu trúc ngôn ngữ của PHP.
+
+% ============================================================
+\section{OOB Server}
+\label{sec:oob-impl}
+% ============================================================
+
+\subsection{Kiến trúc Container}
+
+Container \texttt{phuzz-oob} chạy hai tiến trình đồng thời được quản lý
+bởi \texttt{supervisord}:
+
+\textbf{dnsmasq.} Phân giải wildcard \texttt{*.oob} → \texttt{172.20.0.10},
+cho phép các payload dạng \texttt{http://<token>.oob:8000/} của
+\texttt{SSRFMutator} được ứng dụng mục tiêu phân giải đúng khi thực hiện
+DNS lookup.
+
+\textbf{Flask OOB listener.} HTTP server lắng nghe trên cổng 8000 (HTTP)
+và cổng 8443 (HTTPS với self-signed certificate). Luồng HTTPS chạy trong
+một Python thread riêng để không block Flask chính.
+
+\subsection{Ghi nhận OOB Callback}
+
+Mọi HTTP request đến container --- bất kể method (GET, POST, PUT, DELETE,
+HEAD, OPTIONS, PATCH) và path --- đều được xử lý bởi một catch-all route:
+
+\begin{verbatim}
+@app.route("/<path:path>", methods=[...])
+def catch_all(path: str):
+    token = extract_token(request.path, request.host or "")
+    if token:
+        write_log(token, request.remote_addr or "unknown")
+    return "", 200  # luôn trả về 200 OK
+\end{verbatim}
+
+Luôn trả về \texttt{200 OK} là thiết kế quan trọng: nếu OOB server trả về
+lỗi, ứng dụng PHP có thể raise exception và che giấu tín hiệu hook SSRF.
+
+\subsection{Trích xuất Token}
+
+Hàm \texttt{extract\_token()} hỗ trợ hai phương thức trích xuất:
+
+\begin{verbatim}
+def extract_token(path: str, host: str = "") -> "str | None":
+    first = path.strip("/").split("/")[0]
+    if first:
+        return first   # path-based: /abc123de → "abc123de"
+    # subdomain-based: Host: abc123de.oob:8000 → "abc123de"
+    if host:
+        hostname = host.split(":")[0]
+        if hostname.endswith(".oob"):
+            subdomain = hostname.split(".")[0]
+            return subdomain if subdomain else None
+    return None
+\end{verbatim}
+
+Phương thức \textit{path-based} xử lý 17 trong 21 biến thể payload (IP-based,
+nip.io, sslip.io, hostname-based).
+Phương thức \textit{subdomain-based} xử lý 4 biến thể DNS-based còn lại
+(\texttt{http://<token>.oob:8000/}).
+
+\subsection{Ghi Log Nguyên tử}
+
+Hàm \texttt{write\_log()} dùng mẫu \textit{write-to-temp + os.rename} để
+đảm bảo file log không bao giờ ở trạng thái ghi dở:
+
+\begin{verbatim}
+def write_log(token: str, remote_ip: str) -> None:
+    log_path = os.path.join(OOB_LOGS_DIR, f"{token}.json")
+    if os.path.exists(log_path):
+        return          # first-write-wins
+    entry = json.dumps({
+        "token": token, "ip": remote_ip,
+        "timestamp": int(time.time()),
+    })
+    fd, tmp_path = tempfile.mkstemp(dir=OOB_LOGS_DIR, ...)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(entry)
+    os.chmod(tmp_path, 0o777)
+    os.rename(tmp_path, log_path)   # atomic rename
+\end{verbatim}
+
+\texttt{os.rename()} trên Linux là thao tác nguyên tử tại tầng kernel đối với
+cùng một filesystem, đảm bảo \texttt{VulnChecker} phía fuzzer không bao giờ
+đọc file chưa hoàn chỉnh khi gọi \texttt{os.path.isfile()}.
+
+% ============================================================
+\section{Bộ đột biến SSRF}
+\label{sec:mutator-impl}
+% ============================================================
+
+Hệ thống cung cấp hai mutator chuyên biệt cho phát hiện SSRF, phục vụ
+hai kịch bản tấn công khác nhau.
+\texttt{SSRFMutator} nhắm vào các tham số được ứng dụng dùng trực tiếp
+làm URL trong lời gọi hàm mạng (sink URL-based).
+\texttt{CmdInjectionSSRFMutator} nhắm vào các tham số được truyền vào
+lệnh shell, khai thác lỗ hổng Command Injection để tạo ra kết nối SSRF
+(sink shell-based).
+Cả hai đều kế thừa \texttt{ParamMutator} và dùng chung cơ chế token
+8 ký tự ghi vào \texttt{\_token\_map} để \texttt{SSRFVulnCheck} đối
+chiếu tín hiệu OOB.
+
+% ─────────────────────────────────────────────────────────────
+\subsection{SSRFMutator}
+% ─────────────────────────────────────────────────────────────
+
+\texttt{SSRFMutator} sinh payload OOB theo phương pháp round-robin qua
+21 biến thể. Với mỗi lần được chọn, mutator sinh một token 8 ký tự
+(chữ thường + chữ số), lưu vào dict \texttt{\_token\_map} cùng
+timestamp, rồi nhúng token đó vào biến thể tiếp theo trong chu kỳ:
+
+\begin{verbatim}
+@staticmethod
+def _generate_token() -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choices(alphabet, k=8))
+\end{verbatim}
+
+Hai mươi mốt biến thể được tổ chức thành ba nhóm theo cơ chế định
+tuyến tới OOB server, như liệt kê trong Bảng~\ref{tab:ssrf-variants}.
+Ký hiệu \texttt{<t>} là viết tắt của token 8 ký tự.
+
+\begin{table}[h]{Các biến thể payload của \texttt{SSRFMutator}}
+\label{tab:ssrf-variants}
+\centering
+\small
+\begin{tabular}{|c|p{8.5cm}|p{4.0cm}|}
+\hline
+\textbf{\#} & \textbf{Payload mẫu} & \textbf{Kỹ thuật bypass} \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm 1: IP-based — token nhúng trong URL path (biến thể 0–14)}} \\
+\hline
+0  & \texttt{http://<oob>/<t>}                         & Plain IP \\
+1  & \texttt{http://2886795274:8000/<t>}                & Decimal IP \\
+2  & \texttt{http://0xac14000a:8000/<t>}                & Hex IP \\
+3  & \texttt{http://0254.024.0.012:8000/<t>}            & Octal IP \\
+4  & \texttt{http://[::ffff:172.20.0.10]:8000/<t>}      & IPv6 mapped dotted \\
+5  & \texttt{http://[::ffff:ac14:a]:8000/<t>}           & IPv6 mapped hex \\
+6  & \texttt{http://172.20.0\%2e10:8000/<t>}            & URL-encoded dot \\
+7  & \texttt{http://172.20.0\%252e10:8000/<t>}          & Double-encoded dot \\
+8  & \texttt{http://x@<oob>/<t>}                        & Userinfo trick \\
+9  & \texttt{http://trusted.com@<oob>/<t>}              & Reverse userinfo \\
+10 & \texttt{HTTP://<oob>/<t>}                          & Mixed-case scheme \\
+11 & \texttt{http://172.20.0.10.:8000/<t>}              & Trailing dot \\
+12 & \texttt{http://<oob>/<t>\#trusted.com}             & Fragment bypass \\
+13 & \texttt{http://172.20.0.10.nip.io:8000/<t>}        & nip.io DNS redirect \\
+14 & \texttt{http://172.20.0.10.sslip.io:8000/<t>}      & sslip.io DNS redirect \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm 2: DNS-based — token nhúng trong subdomain (biến thể 15–18)}} \\
+\hline
+15 & \texttt{http://<t>.oob:8000/}                      & Wildcard DNS (\texttt{*.oob}) \\
+16 & \texttt{https://<t>.oob:8000/}                     & HTTPS + wildcard DNS \\
+17 & \texttt{http://x@<t>.oob:8000/}                    & Userinfo + DNS \\
+18 & \texttt{HTTP://<t>.oob:8000/}                      & Mixed-case + DNS \\
+\hline
+\multicolumn{3}{|l|}{\textit{Nhóm 3: Hostname-based — qua \texttt{/etc/hosts} nội bộ (biến thể 19–20)}} \\
+\hline
+19 & \texttt{http://oob.phuzz:8000/<t>}                 & Hostname (\texttt{extra\_hosts}) \\
+20 & \texttt{oob.phuzz:8443/<t>\#}                      & Scheme-less HTTPS bypass \\
+\hline
+\end{tabular}
+\end{table}
+
+Biến thể 20 (scheme-less) được thiết kế đặc biệt cho các ứng dụng tự
+prepend \texttt{https://} vào giá trị tham số trước khi gọi hàm mạng
+--- chẳng hạn plugin Canto (\mbox{CVE-2020-28975}), nơi payload plain IP
+bị URL parser từ chối vì sai scheme. Đây là minh chứng điển hình cho
+sự cần thiết của đa biến thể: một số lỗ hổng chỉ phát hiện được qua
+đúng một biến thể nhất định.
+
+% ─────────────────────────────────────────────────────────────
+\subsection{CmdInjectionSSRFMutator}
+% ─────────────────────────────────────────────────────────────
+
+\texttt{CmdInjectionSSRFMutator} nhắm vào các endpoint mà tham số đầu
+vào được truyền vào hàm shell (\texttt{shell\_exec}, \texttt{system},
+\texttt{exec}, \texttt{passthru}, \texttt{popen}). Chiến lược là giữ
+nguyên giá trị tham số gốc ở đầu payload --- để ứng dụng không báo lỗi
+--- rồi nối thêm lệnh \texttt{curl}/\texttt{wget} trỏ tới OOB server
+bằng một toán tử tách lệnh shell. Mười biến thể bao phủ các toán tử
+phổ biến trên nhiều shell khác nhau (Bảng~\ref{tab:cmdinj-variants}).
+
+\begin{table}[h]{Các biến thể payload của \texttt{CmdInjectionSSRFMutator}}
+\label{tab:cmdinj-variants}
+\centering
+\small
+\begin{tabular}{|c|l|p{9.5cm}|}
+\hline
+\textbf{\#} & \textbf{Toán tử} & \textbf{Payload mẫu} \\
+\hline
+0 & Semicolon    & \texttt{<val>; curl http://172.20.0.10:8000/<t>} \\
+1 & Pipe         & \texttt{<val> | curl -s http://172.20.0.10:8000/<t>} \\
+2 & Background   & \texttt{<val>\& curl http://172.20.0.10:8000/<t> \&} \\
+3 & Logical-AND  & \texttt{<val> \&\& curl http://172.20.0.10:8000/<t>} \\
+4 & Subshell     & \texttt{<val> \$(curl -s http://172.20.0.10:8000/<t>)} \\
+5 & Backtick     & \texttt{<val> `curl -s http://172.20.0.10:8000/<t>`} \\
+6 & wget         & \texttt{<val>; wget -q -O- http://172.20.0.10:8000/<t>} \\
+7 & Newline      & \texttt{<val>}\textbackslash\texttt{ncurl http://172.20.0.10:8000/<t>} \\
+8 & Null-byte    & \texttt{<val>\%00; curl http://172.20.0.10:8000/<t>} \\
+9 & Hostname     & \texttt{<val>; curl http://oob.phuzz:8000/<t>} \\
+\hline
+\end{tabular}
+\end{table}
+
+Biến thể 4 (subshell \texttt{\$()}) và biến thể 5 (backtick) đặc biệt
+hữu ích khi bộ lọc đầu vào chặn dấu chấm phẩy và dấu pipe nhưng bỏ
+sót command substitution. Biến thể 8 (null-byte \texttt{\%00}) nhắm vào
+các ứng dụng C/PHP tách chuỗi tại ký tự null. Biến thể 9 dùng hostname
+\texttt{oob.phuzz} thay vì IP để vượt qua bộ lọc chặn địa chỉ RFC-1918
+ở tầng shell.
+
+% ─────────────────────────────────────────────────────────────
+\subsection{Tích hợp vào Fuzzer}
+% ─────────────────────────────────────────────────────────────
+
+\texttt{SSRFMutator} được tích hợp vào \texttt{SingleMutator} qua lazy
+import, đặt cùng danh sách với các \texttt{ParamMutator} gốc của Phuzz:
+
+\begin{verbatim}
+class SingleMutator(Mutator):
+    def __init__(self):
+        self.param_mutators = [
+            IterateCharParamMutator(), AddCharParamMutator(),
+            EquallyRandomCharParamMutator(), ...
+            SuperRandomMutator()
+        ]
+        try:
+            from ssrf_mutator import SSRFMutator
+            self.param_mutators.append(SSRFMutator())
+        except ImportError:
+            pass
+\end{verbatim}
+
+Danh sách được xáo trộn ngẫu nhiên mỗi vòng iteration. Vì
+\texttt{SSRFMutator} là một trong 13 mutator, xác suất mỗi lần đột biến
+chọn \texttt{SSRFMutator} là khoảng $\frac{1}{13} \approx 7.7\%$.
+
+Ngoài ra, hệ thống cung cấp hai mutator chuyên biệt:
+\texttt{SSRFOnlyMutator} (mọi đột biến đều dùng \texttt{SSRFMutator})
+và \texttt{CmdInjSSRFOnlyMutator} (mọi đột biến đều dùng
+\texttt{CmdInjectionSSRFMutator}), dùng cho các endpoint mà người dùng
+biết chắc là SSRF sink và muốn tập trung toàn bộ ngân sách đột biến vào
+kiểm thử SSRF.
+
+% ============================================================
+\section{Cơ chế Phát hiện Hai Tầng và Chấm điểm}
+\label{sec:feedback-impl}
+% ============================================================
+
+\subsection{SSRFVulnCheck: Kiểm tra Hai Tầng}
+
+\texttt{SSRFVulnCheck} triển khai giao diện \texttt{VulnCheck} với phương
+thức \texttt{check(candidate)}. Toàn bộ logic dựa trên đọc file từ
+shared-tmpfs, không có blocking I/O hay network call:
+
+\begin{verbatim}
+def check(self, candidate) -> bool:
+    # Tầng 1: PHP hook có ghi nhận không?
+    hook_file = f"/shared-tmpfs/ssrf-hooks/{candidate.coverage_id}.json"
+    if not os.path.isfile(hook_file):
+        return False
+    with open(hook_file) as fh:
+        hook_data = json.load(fh)
+
+    # Trích xuất token từ đối số hàm mạng
+    argument = hook_data.get("argument", "")
+    token = self._extract_token(argument)
+    if not token:
+        return False
+
+    # Tầng 2: OOB server đã nhận callback không?
+    oob_file = f"/shared-tmpfs/oob-logs/{token}.json"
+    if not os.path.isfile(oob_file):
+        return False
+
+    # Xác nhận: cả hai tín hiệu đều có mặt
+    candidate.score += SSRF_CRITICAL_SCORE  # += 1000
+    ...
+    return True
+\end{verbatim}
+
+Thiết kế \textit{AND logic} --- yêu cầu cả hai file tồn tại --- là yếu tố
+cốt lõi loại bỏ false positive: Tầng 1 đơn độc chỉ chứng minh payload SSRF
+đã lan truyền tới hàm mạng; Tầng 2 đơn độc có thể có false positive nếu
+OOB server nhận kết nối từ nguồn khác. Sự kết hợp của cả hai mới là bằng
+chứng đầy đủ của một lỗ hổng SSRF.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Flowchart logic phát hiện hai tầng của SSRFVulnCheck.
+    % Bắt đầu: hình elip "check(candidate)".
+    % Bước 1: hình thoi "ssrf-hooks/<covID>.json tồn tại?"
+    %   → Không: hình chữ nhật "return False" (kết thúc).
+    %   → Có: tiếp tục.
+    % Bước 2: hình chữ nhật "Đọc argument từ hook file".
+    % Bước 3: hình thoi "Trích được token từ argument?"
+    %   → Không: "return False".
+    %   → Có: tiếp tục.
+    % Bước 4: hình thoi "oob-logs/<token>.json tồn tại?"
+    %   → Không: "return False".
+    %   → Có: tiếp tục.
+    % Bước 5: hình chữ nhật "Tăng score += 1000, ghi ssrf-error-reports/".
+    % Kết thúc: hình elip "return True (SSRF xác nhận)".
+    % Ghi chú bên cạnh bước 4: "Tầng 2: OOB callback = bằng chứng mạng thực tế".
+    % Ghi chú bên cạnh bước 1: "Tầng 1: PHP hook đã kích hoạt".
+    \includegraphics[width=0.60\textwidth]{figures/fig-detection-flow}
+    \caption{Sơ đồ luồng phát hiện lỗ hổng của \texttt{SSRFVulnCheck}.}
+    \label{fig:detection-flow}
+\end{figure}
+
+\subsection{Trích xuất Token từ Payload}
+
+Hàm \texttt{\_extract\_token()} xử lý đặc điểm riêng của từng nhóm biến thể
+payload:
+
+\begin{verbatim}
+@staticmethod
+def _extract_token(url: str) -> "str | None":
+    # Xử lý Command Injection: trích URL từ lệnh shell
+    if not lower.startswith(("http://", "https://", "ftp://")):
+        m = re.search(r'https?://\S+', lower)
+        if m:
+            url = m.group(0)
+
+    parsed = urlparse(url.lower())
+    hostname = (parsed.hostname or "").rstrip(".")  # bỏ trailing dot
+
+    # IP-based: token ở path segment đầu tiên
+    if hostname == OOB_HOST:
+        return parsed.path.strip("/").split("/")[0].split("#")[0] or None
+
+    # DNS-based: token ở subdomain trái nhất của *.oob
+    if hostname.endswith(f".{OOB_DOMAIN}"):
+        return hostname.split(".")[0] or None
+
+    # nip.io / sslip.io: OOB_HOST là prefix của hostname
+    if hostname.startswith(f"{OOB_HOST}."):
+        return parsed.path.strip("/").split("/")[0].split("#")[0] or None
+
+    # Hostname-based: oob.phuzz → token ở path
+    if hostname == OOB_HOSTNAME:
+        return parsed.path.strip("/").split("/")[0].split("#")[0] or None
+\end{verbatim}
+
+Hai điểm kỹ thuật đáng chú ý: (1) \texttt{.rstrip(".")} xử lý biến thể
+trailing dot (variant 11) khi PHP trả lại URL với dấu chấm thừa; (2) xử lý
+Command Injection dùng \texttt{re.search} tìm URL được nhúng trong chuỗi
+lệnh shell trước khi parse.
+
+\subsection{Chấm điểm và Báo cáo}
+
+Khi xác nhận SSRF, \texttt{SSRFVulnCheck} thực hiện ba hành động:
+
+\begin{enumerate}
+    \item \textbf{Tăng điểm}: \texttt{candidate.score += 1000}
+    (\texttt{SSRF\_CRITICAL\_SCORE}). Điểm cao đảm bảo ứng viên SSRF được
+    ưu tiên chọn trong các vòng lặp tiếp theo để tiếp tục đào sâu.
+    \item \textbf{Ghi report}: JSON report với các trường \texttt{type},
+    \texttt{candidateID}, \texttt{payload}, \texttt{url},
+    \texttt{hookedFunction} được ghi vào
+    \texttt{/shared-tmpfs/ssrf-error-reports/<candidateID>.json}.
+    \item \textbf{Trả về \texttt{True}}: để framework Phuzz ghi nhận
+    ứng viên vào \texttt{vulnerable\_candidates['SSRF']}.
+\end{enumerate}
+
+% ============================================================
+\section{Tích hợp vào Vòng lặp Fuzz Chính}
+\label{sec:integration}
+% ============================================================
+
+\subsection{Điểm Tích hợp trong fuzzer.py}
+
+Tích hợp SSRF vào \texttt{fuzzer.py} được thực hiện tại hai điểm khởi tạo
+trong hàm \texttt{\_\_init\_\_} của lớp \texttt{Fuzzer}:
+
+\begin{verbatim}
+from ssrf_vulncheck import SSRFVulnCheck
+...
+self.vulnchecker = ParamBasedVulnChecker(
+    mysql_errors_folder=...,
+    shell_errors_folder=...,
+    ...
+)
+self.vulnchecker.vuln_checkers.append(
+    SSRFVulnCheck(ssrf_errors_folder=self.ssrf_errors_folder)
+)
+\end{verbatim}
+
+\texttt{SSRFVulnCheck} được append vào danh sách
+\texttt{ParamBasedVulnChecker.vuln\_checkers} --- danh sách này được duyệt
+tuần tự sau mỗi request. Không cần sửa đổi logic của
+\texttt{ParamBasedVulnChecker}: SSRF hoạt động hoàn toàn như một plugin độc
+lập.
+
+\subsection{Luồng Thực thi Đầy đủ}
+
+Hình~\ref{fig:sequence-ssrf} mô tả luồng thực thi đầy đủ từ khi fuzzer chọn
+ứng viên đến khi xác nhận lỗ hổng SSRF qua cơ chế hai tầng.
+
+\begin{figure}[htbp]
+    \centering
+    % Mô tả hình: Sequence diagram đầy đủ của một chu kỳ phát hiện SSRF.
+    % Các thực thể (cột từ trái sang phải, mỗi cột là một thanh dọc):
+    %   SingleMutator | Fuzzer | phuzz-web (PHP) | phuzz-oob (Flask) | shared-tmpfs | SSRFVulnCheck
+    % Luồng thông điệp theo số thứ tự:
+    %   1. Fuzzer → SingleMutator: mutate(candidate).
+    %   2. SingleMutator → SSRFMutator: mutate("old_value") — chọn ngẫu nhiên.
+    %   3. SSRFMutator → SSRFMutator: sinh token "ab12cd34", lưu token_map.
+    %   4. SSRFMutator → Fuzzer: trả về payload "http://172.20.0.10:8000/ab12cd34".
+    %   5. Fuzzer → phuzz-web: HTTP POST [X-Fuzzer-Covid: req-001] url="http://172.20.0.10:8000/ab12cd34".
+    %   6. phuzz-web → phuzz-web: PHP hook UOPZ kích hoạt → ghi ssrf-hooks/req-001.json.
+    %   7. phuzz-web → phuzz-oob: GET /ab12cd34 HTTP/1.1 (PHP thực sự gọi file_get_contents).
+    %   8. phuzz-oob → phuzz-oob: extract_token("/ab12cd34") = "ab12cd34".
+    %   9. phuzz-oob → shared-tmpfs: write oob-logs/ab12cd34.json (atomic rename).
+    %   10. phuzz-oob → phuzz-web: HTTP 200 OK.
+    %   11. phuzz-web → phuzz-web: ghi coverage-reports/req-001.json.
+    %   12. phuzz-web → Fuzzer: HTTP 200 OK (response bình thường, không có dấu hiệu SSRF).
+    %   13. Fuzzer → SSRFVulnCheck: check(candidate "req-001").
+    %   14. SSRFVulnCheck → shared-tmpfs: đọc ssrf-hooks/req-001.json → token="ab12cd34".
+    %   15. SSRFVulnCheck → shared-tmpfs: đọc oob-logs/ab12cd34.json → EXISTS!
+    %   16. SSRFVulnCheck → Fuzzer: True — ghi ssrf-error-reports/req-001.json.
+    \includegraphics[width=\textwidth]{figures/fig-sequence-ssrf}
+    \caption{Sequence diagram một chu kỳ phát hiện Blind SSRF.}
+    \label{fig:sequence-ssrf}
+\end{figure}
+
+\begin{enumerate}
+    \item Fuzzer chọn ứng viên $c$ từ hàng đợi; \texttt{SingleMutator} sinh
+    đột biến $c'$ bằng cách chọn ngẫu nhiên \texttt{SSRFMutator} trong số
+    13 mutator.
+    \item \texttt{SSRFMutator.mutate()} sinh token 8 ký tự, lưu vào
+    \texttt{\_token\_map}, trả về payload OOB theo biến thể round-robin.
+    \item Fuzzer thêm header \texttt{X-Fuzzer-Covid: <ID>} và gửi HTTP
+    request tới \texttt{phuzz-web}.
+    \item PHP đọc \texttt{\$\_SERVER['HTTP\_X\_FUZZER\_COVID']} →
+    \texttt{\_\_FUZZER\_\_COVID = <ID>}. \texttt{08\_ssrf.php} đã hook sẵn
+    các hàm mạng.
+    \item Khi ứng dụng gọi, ví dụ,
+    \texttt{file\_get\_contents(\$\_GET['url'])} với URL là payload OOB:
+    hook UOPZ kích hoạt \texttt{\_\_fuzzer\_\_ssrf\_log()} → ghi
+    \texttt{ssrf-hooks/<ID>.json}.
+    \item Đồng thời, PHP thực hiện HTTP request tới OOB server.
+    Flask trên \texttt{phuzz-oob} nhận request → trích token → ghi
+    \texttt{oob-logs/<token>.json}.
+    \item Fuzzer nhận HTTP response; \texttt{ParamBasedVulnChecker} gọi
+    \texttt{SSRFVulnCheck.check(c')}:
+    (a) đọc \texttt{ssrf-hooks/<ID>.json} → lấy argument → trích token;
+    (b) kiểm tra \texttt{oob-logs/<token>.json};
+    (c) nếu cả hai tồn tại: xác nhận SSRF, tăng điểm 1000, ghi report.
+    \item Fuzzer ghi nhận $c'$ vào \texttt{vulnerable\_candidates['SSRF']};
+    ứng viên được giữ lại trong pool với điểm cao để tiếp tục đào sâu.
+\end{enumerate}
+
+\subsection{Xử lý Bất đồng bộ}
+
+Bước 6 và bước 7 có thể không diễn ra theo đúng thứ tự: request SSRF do PHP
+thực hiện đôi khi đến OOB server sau khi fuzzer đã kiểm tra
+\texttt{oob-logs/<token>.json} (vì background job xử lý chậm). Trong
+trường hợp này, \texttt{SSRFVulnCheck.check()} trả về \texttt{False} ở
+lần kiểm tra đầu tiên.
+
+Tuy nhiên, hook file \texttt{ssrf-hooks/<ID>.json} vẫn tồn tại và ứng viên
+được giữ trong pool. Vào vòng lặp fuzz tiếp theo, nếu ứng viên được chọn lại
+và gửi thêm đột biến, VulnChecker sẽ kiểm tra lại. Hơn nữa, vì token nằm
+trong \texttt{\_token\_map}, fuzzer có thể bổ sung logic tra cứu trễ
+(\textit{deferred lookup}) trong các vòng lặp sau.
+
+\section{Tổng kết Chương}
+
+Chương này đã trình bày đầy đủ cả lý thuyết lẫn cài đặt của hệ thống đề xuất.
+
+SSRF là lớp lỗ hổng phức tạp với nhiều vector tấn công, đặc biệt nguy hiểm
+trong hệ sinh thái PHP do tính năng stream wrapper và sự phổ biến của
+WordPress API. Dạng Blind SSRF không để lại bất kỳ dấu hiệu trong HTTP
+response hay coverage --- kênh OOB là tín hiệu duy nhất có khả năng xác nhận
+lỗ hổng này. Cơ chế token-based correlation đảm bảo mỗi phát hiện được gắn
+chính xác với ứng viên đã kích hoạt nó, loại trừ false positive ngay trong
+môi trường song song.
+
+Bốn container Docker phối hợp qua shared-tmpfs volume và mạng nội bộ cố định,
+tạo ra hạ tầng hoàn chỉnh cho phát hiện Blind SSRF. Hook PHP (23 hook trên
+5 nhóm hàm) thu thập tín hiệu in-band ngay tại thời điểm ứng dụng gọi hàm
+mạng với payload của fuzzer. OOB server (Flask + dnsmasq, ghi log nguyên tử)
+cung cấp tín hiệu out-of-band độc lập và không thể giả mạo. Bộ đột biến 21
+biến thể bao phủ hầu hết các kỹ thuật bypass SSRF phổ biến. Logic AND hai
+tầng của \texttt{SSRFVulnCheck} đảm bảo không có false positive.
+
+Chương~4 sẽ đánh giá hiệu quả của hệ thống này trên các ứng dụng thực tế.
