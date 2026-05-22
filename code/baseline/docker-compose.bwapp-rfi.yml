@@ -1,4 +1,4 @@
-name: phuzz-bwapp-rfi-baseline
+﻿name: phuzz-bwapp-rfi-baseline
 
 # bWAPP Remote File Inclusion → SSRF
 # Baseline: original PHUZZ — no SSRFMutator, no SSRFVulnCheck, no OOB listener.
@@ -57,6 +57,7 @@ services:
       FUZZER_NO_SSRF:   1        # disable SSRFMutator + SSRFVulnCheck
     volumes:
       - ../fuzzer:/app
+      - ../fuzzer/output-baseline:/app/output
       - shared-tmpfs:/shared-tmpfs
       - sync-tmpfs:/sync-tmpfs
     depends_on:
