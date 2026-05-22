@@ -51,7 +51,7 @@ services:
     environment:
       PYTHONUNBUFFERED: 1
       FUZZER_NODE_ID:   1
-      FUZZER_CONFIG:    dvwa/cmdi_ssrf
+      FUZZER_CONFIG:    dvwa/rce_low
       FUZZER_CLEANUP:   1
       FUZZER_COMPRESS:  0
       FUZZER_NO_SSRF:   1        # disable SSRFMutator + SSRFVulnCheck

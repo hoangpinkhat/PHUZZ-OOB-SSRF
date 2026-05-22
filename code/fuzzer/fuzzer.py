@@ -531,7 +531,10 @@ class Fuzzer:
 
     def ff_mutate(self, c):
 
-        if self.config.get('cmdi_ssrf_only'):
+        if os.environ.get("FUZZER_NO_SSRF"):
+            # Baseline mode: ignore ssrf_only/cmdi_ssrf_only flags, use normal mutations
+            mutator = SingleMutator()
+        elif self.config.get('cmdi_ssrf_only'):
             mutator = CmdInjSSRFOnlyMutator()
         elif self.config.get('ssrf_only'):
             mutator = SSRFOnlyMutator()
