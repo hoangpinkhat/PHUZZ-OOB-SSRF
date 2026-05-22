@@ -264,12 +264,14 @@ class SingleMutator(Mutator):
             SuperRandomMutator()
         ]
 
-        # Inject SSRFMutator if available (lazy import avoids circular deps)
-        try:
-            from ssrf_mutator import SSRFMutator
-            self.param_mutators.append(SSRFMutator())
-        except ImportError:
-            pass
+        # Inject SSRFMutator unless disabled (FUZZER_NO_SSRF=1 → baseline/original mode)
+        import os as _os
+        if not _os.environ.get("FUZZER_NO_SSRF"):
+            try:
+                from ssrf_mutator import SSRFMutator
+                self.param_mutators.append(SSRFMutator())
+            except ImportError:
+                pass
 
         self.iterator = self.mutation_iterator()
 

@@ -1,0 +1,90 @@
+﻿name: phuzz-ssrf-vlab-baseline
+
+# Baseline: original PHUZZ â€” no SSRFMutator, no SSRFVulnCheck, no OOB listener.
+
+services:
+
+  phuzz-web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE:     ssrf-vulnerable-lab
+      FUZZER_COVERAGE_PATH: /var/www/html/
+      FUZZER_COMPRESS:      0
+      REQUIRES_DB:          0
+    volumes:
+      - ../web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - "8080:80"
+    networks:
+      phuzz-net:
+        aliases: [web]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared-tmpfs/web-paths.txt"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  phuzz-fuzzer-fgc:
+    build:
+      context: ../fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   1
+      FUZZER_CONFIG:    ssrf-vulnerable-lab/fgc
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+      FUZZER_NO_SSRF:   1
+    volumes:
+      - ../fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+    networks: [phuzz-net]
+
+  phuzz-fuzzer-dns:
+    build:
+      context: ../fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID:   3
+      FUZZER_CONFIG:    ssrf-vulnerable-lab/dns_rebinding
+      FUZZER_CLEANUP:   1
+      FUZZER_COMPRESS:  0
+      FUZZER_NO_SSRF:   1
+    volumes:
+      - ../fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs:/sync-tmpfs
+    depends_on:
+      phuzz-web:
+        condition: service_healthy
+    networks: [phuzz-net]
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000"
+  sync-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=256m,uid=1000"
+
+networks:
+  phuzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+

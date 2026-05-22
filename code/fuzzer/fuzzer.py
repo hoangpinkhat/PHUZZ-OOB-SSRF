@@ -101,7 +101,8 @@ class Fuzzer:
             pathtraversal_errors_folder=self.pathtraversal_errors_folder,
             xxe_errors_folder=self.xxe_errors_folder,
             )
-        self.vulnchecker.vuln_checkers.append(SSRFVulnCheck(ssrf_errors_folder=self.ssrf_errors_folder))
+        if not os.environ.get("FUZZER_NO_SSRF"):
+            self.vulnchecker.vuln_checkers.append(SSRFVulnCheck(ssrf_errors_folder=self.ssrf_errors_folder))
         ###
         # END Define Fuzzing modules
         ####
