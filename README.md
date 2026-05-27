@@ -58,9 +58,6 @@ PHUZZ is a grey-box coverage-guided fuzzer for PHP web applications (AsiaCCS 202
 | `code/oob/oob_listener.py` | Flask HTTP/HTTPS listener — writes `/shared-tmpfs/oob-logs/<token>.json` atomically |
 | `code/oob/dnsmasq.conf` | Resolves `*.oob` wildcard → `172.20.0.10` |
 | `code/oob/Dockerfile` | Builds OOB container (dnsmasq + Flask + openssl self-signed cert) |
-| `code/docker-compose.ssrf-xvwa.yml` | XVWA SSRF environment |
-| `code/docker-compose.ssrf-lab.yml` | ssrf-lab environment (curl + advanced filter bypass) |
-| `code/docker-compose.ssrf-vulnerable-lab.yml` | SSRF_Vulnerable_Lab environment |
 
 ### Integration into existing modules
 
@@ -128,17 +125,7 @@ self.vuln_checkers.append(SSRFVulnCheck())
 
 ---
 
-## Target Applications
 
-| Application | Compose file | Fuzzer config | PHP function targeted |
-|-------------|-------------|---------------|-----------------------|
-| **XVWA** | `docker-compose.ssrf-xvwa.yml` | `xvwa/ssrf` | `file_get_contents` via `img_url` |
-| **ssrf-lab** (basic) | `docker-compose.ssrf-lab.yml` | `ssrf-lab/curl` | `curl_exec` via `handler` |
-| **ssrf-lab** (advanced) | `docker-compose.ssrf-lab.yml` | `ssrf-lab/advanced1` | `curl_exec` with filter bypass |
-| **SSRF_Vulnerable_Lab** (fgc) | `docker-compose.ssrf-vulnerable-lab.yml` | `ssrf-vulnerable-lab/fgc` | `file_get_contents` |
-| **SSRF_Vulnerable_Lab** (DNS) | `docker-compose.ssrf-vulnerable-lab.yml` | `ssrf-vulnerable-lab/dns_rebinding` | `file_get_contents` + DNS rebinding |
-
----
 
 ## Quick Start
 
@@ -156,27 +143,6 @@ docker compose -f docker-compose.ssrf-xvwa.yml up --build
 docker compose -f docker-compose.ssrf-xvwa.yml down -v
 ```
 
-### ssrf-lab (curl_exec + filter bypass)
-
-```bash
-cd code/
-
-docker compose -f docker-compose.ssrf-lab.yml up --build
-# Runs two fuzzer instances: ssrf-lab/curl and ssrf-lab/advanced1 in parallel
-
-docker compose -f docker-compose.ssrf-lab.yml down -v
-```
-
-### SSRF_Vulnerable_Lab
-
-```bash
-cd code/
-
-docker compose -f docker-compose.ssrf-vulnerable-lab.yml up --build
-# Runs two fuzzer instances: ssrf-vulnerable-lab/fgc and ssrf-vulnerable-lab/dns_rebinding
-
-docker compose -f docker-compose.ssrf-vulnerable-lab.yml down -v
-```
 
 ### View results (any environment)
 
